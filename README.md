@@ -15,6 +15,11 @@ python3 ui.py
 then open http://localhost:8000 (it opens automatically). No
 dependencies beyond the Python standard library.
 
+Or use the serverless single-page version, `index.html` — the same UI
+with the simulator ported to JavaScript, hosted at
+https://lukacslacko.github.io/fet/ (or open the file locally). It is
+generated from `ui.py` by `make_index.py`; regenerate after changes.
+
 ## Keys
 
 Point at a square and press:
@@ -35,3 +40,5 @@ Point at a square and press:
 - `ui.py` — the web UI and the grid-to-circuit builder.
 - `sim_handwritten.py` — an earlier hand-written incremental simulator,
   kept for reference.
+- `make_index.py` / `index.html` — generator for and result of the
+  static single-page version (JavaScript simulator embedded).

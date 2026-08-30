@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>FET grid</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #fafafa; margin: 16px; }
+  canvas { background: #fff; border: 1px solid #999; cursor: crosshair; }
+  #legend { color: #555; margin-top: 8px; }
+  #status { color: #c40; font-weight: 600; margin-top: 6px; min-height: 1.2em; }
+  kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: 0 4px; }
+  dialog { border: 1px solid #999; border-radius: 6px; padding: 12px; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.3); }
+  #jsonText { width: 480px; height: 320px; font-family: monospace; font-size: 12px; }
+  #jsonRow { margin-top: 8px; display: flex; gap: 12px; align-items: center; }
+  #jsonNote { color: #555; }
+</style>
+</head>
+<body>
+<canvas id="grid"></canvas>
+<div id="legend">
+  <kbd>p</kbd> pullup &nbsp; <kbd>g</kbd> ground &nbsp;
+  <kbd>l</kbd>/<kbd>r</kbd> left/right transistor &nbsp;
+  <kbd>w</kbd>/<kbd>a</kbd>/<kbd>s</kbd>/<kbd>d</kbd> toggle wire arm &nbsp;
+  <kbd>x</kbd> crossing &nbsp; <kbd>b</kbd> button &nbsp;
+  <kbd>n</kbd> name net &nbsp;
+  <kbd>enter</kbd> flip button &nbsp; <kbd>space</kbd> clear &nbsp;
+  <kbd>&larr;&uarr;&darr;&rarr;</kbd> scroll &nbsp; <kbd>+</kbd>/<kbd>-</kbd> zoom &nbsp;
+  <kbd>j</kbd> json
+</div>
+<div id="status"></div>
+<dialog id="nameDialog">
+  <div>Net name (empty removes it):</div>
+  <input id="nameInput" spellcheck="false"
+         style="margin-top: 6px; width: 240px; text-transform: uppercase;">
+</dialog>
+<dialog id="jsonDialog">
+  <textarea id="jsonText" spellcheck="false"></textarea>
+  <div id="jsonRow">
+    <button id="replaceBtn">Replace</button>
+    <span id="jsonNote"></span>
+  </div>
+</dialog>
+<script>
+const CELL = 64;    // world pixels per square
+
+const canvas = document.getElementById('grid');
+const ctx = canvas.getContext('2d');
+
+// The grid is infinite and sparse: cells maps 'row,col' (integers, may
+// be negative) to 'pullup', 'ground', 'left', 'right', 'cross',
+// 'btn-open', 'btn-closed', or a wire object {n, w, e, s} of booleans
+// (at least one true) with an optional string property 'name'. All
+// wires sharing a name are treated as one net. Absent keys are empty
+// squares.
+const cells = new Map();
+let hover = null;      // {row, col} under the mouse, or null
+let lastMouse = null;  // last mouse position in canvas pixels
+let simStates = null;  // 'row,col' -> {dir: 'FLOAT'|'HIGH'|'LOW'} from the server
+
+// View: the world point at the canvas top-left corner, and the scale.
+let viewX = -CELL / 2, viewY = -CELL / 2, zoom = 1;
+
+function getCell(row, col) {
+  return cells.get(row + ',' + col) || null;
+}
+
+function setCell(row, col, value) {
+  if (value === null) cells.delete(row + ',' + col);
+  else cells.set(row + ',' + col, value);
+}
+
+function resize() {
+  canvas.width = Math.max(300, window.innerWidth - 34);
+  canvas.height = Math.max(300, window.innerHeight - 120);
+  redraw();
+}
+window.addEventListener('resize', resize);
+
+function zoomBy(factor) {
+  // Zoom around the canvas center.
+  const midX = viewX + canvas.width / (2 * zoom);
+  const midY = viewY + canvas.height / (2 * zoom);
+  zoom = Math.min(4, Math.max(0.2, zoom * factor));
+  viewX = midX - canvas.width / (2 * zoom);
+  viewY = midY - canvas.height / (2 * zoom);
+}
+
+const WIRE_COLORS = {FLOAT: '#999', HIGH: '#d22', LOW: '#000'};
+const status = document.getElementById('status');
+
+// ---------- Simulator: JavaScript port of sim.py and the circuit
+// builder from ui.py, so the page runs without a server. ----------
+const SIM_MAX_ITERATIONS = 2000;
+
+function cellPortsOf(cell) {
+  if (!cell) return [];
+  if (typeof cell === 'object') return 'nwes'.split('').filter(d => cell[d]);
+  return {'pullup': ['s'], 'ground': ['n'],
+          'left': ['n', 's', 'w'], 'right': ['n', 's', 'e'],
+          'cross': ['n', 's', 'w', 'e'],
+          'btn-open': ['n', 's'], 'btn-closed': ['n', 's']}[cell];
+}
+
+// Union-find over cell edge ports; touching ports of adjacent cells
+// share a node, as do ports joined inside a cell and same-named nets.
+function buildCircuit() {
+  const parent = new Map();
+  const find = p => {
+    while (parent.get(p) !== p) {
+      parent.set(p, parent.get(parent.get(p)));
+      p = parent.get(p);
+    }
+    return p;
+  };
+  const union = (a, b) => parent.set(find(a), find(b));
+
+  for (const [key, cell] of cells) {
+    for (const d of cellPortsOf(cell)) parent.set(key + ',' + d, key + ',' + d);
+  }
+  for (const [key, cell] of cells) {
+    const [r, c] = key.split(',').map(Number);
+    const ports = cellPortsOf(cell);
+    if (typeof cell === 'object') {
+      for (let i = 1; i < ports.length; i++) {
+        union(key + ',' + ports[0], key + ',' + ports[i]);
+      }
+    } else if (cell === 'cross') {
+      union(key + ',n', key + ',s');
+      union(key + ',w', key + ',e');
+    }
+    const east = r + ',' + (c + 1) + ',w', south = (r + 1) + ',' + c + ',n';
+    if (ports.includes('e') && parent.has(east)) union(key + ',e', east);
+    if (ports.includes('s') && parent.has(south)) union(key + ',s', south);
+  }
+  const named = new Map();
+  for (const [key, cell] of cells) {
+    if (typeof cell === 'object' && cell.name) {
+      const anchor = key + ',' + cellPortsOf(cell)[0];
+      if (named.has(cell.name)) union(named.get(cell.name), anchor);
+      else named.set(cell.name, anchor);
+    }
+  }
+
+  const rootNodes = new Map();
+  const portNodes = new Map();
+  for (const p of parent.keys()) {
+    const root = find(p);
+    if (!rootNodes.has(root)) rootNodes.set(root, {state: 'FLOAT'});
+    portNodes.set(p, rootNodes.get(root));
+  }
+
+  const circuit = {transistors: [], pullups: [], grounds: [], buttons: []};
+  const buttonsByCell = new Map();
+  for (const [key, cell] of cells) {
+    if (cell === 'pullup') {
+      circuit.pullups.push({node: portNodes.get(key + ',s')});
+    } else if (cell === 'ground') {
+      circuit.grounds.push({node: portNodes.get(key + ',n')});
+    } else if (cell === 'left' || cell === 'right') {
+      circuit.transistors.push({
+        source: portNodes.get(key + ',s'),
+        gate: portNodes.get(key + ',' + (cell === 'left' ? 'w' : 'e')),
+        drain: portNodes.get(key + ',n')});
+    } else if (cell === 'btn-open' || cell === 'btn-closed') {
+      const button = {up: portNodes.get(key + ',n'),
+                      down: portNodes.get(key + ',s'),
+                      pressed: cell === 'btn-closed'};
+      circuit.buttons.push(button);
+      buttonsByCell.set(key, button);
+    }
+  }
+  return {circuit, portNodes, buttonsByCell};
+}
+
+// One synchronous update step; true when nothing changed. Conduction is
+// sampled from the entry states, then every node is recomputed: nodes
+// joined by conducting channels form a group, LOW if it touches a
+// ground, else HIGH if it touches a pullup, else FLOAT.
+function settleStep(circuit) {
+  const nodes = new Set();
+  for (const t of circuit.transistors) {
+    nodes.add(t.source); nodes.add(t.gate); nodes.add(t.drain);
+  }
+  for (const p of circuit.pullups) nodes.add(p.node);
+  for (const g of circuit.grounds) nodes.add(g.node);
+  for (const b of circuit.buttons) { nodes.add(b.up); nodes.add(b.down); }
+
+  const parent = new Map();
+  for (const n of nodes) parent.set(n, n);
+  const find = n => {
+    while (parent.get(n) !== n) {
+      parent.set(n, parent.get(parent.get(n)));
+      n = parent.get(n);
+    }
+    return n;
+  };
+  const union = (a, b) => parent.set(find(a), find(b));
+
+  for (const t of circuit.transistors) if (t.gate.state === 'HIGH') union(t.source, t.drain);
+  for (const b of circuit.buttons) if (b.pressed) union(b.up, b.down);
+
+  const grounded = new Set(circuit.grounds.map(g => find(g.node)));
+  const pulledUp = new Set(circuit.pullups.map(p => find(p.node)));
+
+  let changed = false;
+  for (const n of nodes) {
+    const root = find(n);
+    const state = grounded.has(root) ? 'LOW' : pulledUp.has(root) ? 'HIGH' : 'FLOAT';
+    if (n.state !== state) { n.state = state; changed = true; }
+  }
+  return !changed;
+}
+
+// Grid content with button open/closed collapsed away: edits that only
+// flip buttons reuse the circuit, so a flip-flop keeps its memory.
+function topologyKey() {
+  const entries = [...cells.entries()].map(([key, cell]) => {
+    if (typeof cell === 'object') {
+      return [key, 'wire:' + 'nwes'.split('').filter(d => cell[d]).join('') +
+                   ':' + (cell.name || '')];
+    }
+    if (cell === 'btn-open' || cell === 'btn-closed') return [key, 'button'];
+    return [key, cell];
+  });
+  entries.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  return JSON.stringify(entries);
+}
+
+let cachedSim = null;   // {key, circuit, portNodes, buttonsByCell}
+
+function simulate() {
+  const key = topologyKey();
+  if (!cachedSim || cachedSim.key !== key) cachedSim = {key, ...buildCircuit()};
+  for (const [cellKey, cell] of cells) {
+    if (cell === 'btn-open' || cell === 'btn-closed') {
+      cachedSim.buttonsByCell.get(cellKey).pressed = cell === 'btn-closed';
+    }
+  }
+  let settled = false, error = null;
+  try {
+    for (let i = 0; i < SIM_MAX_ITERATIONS; i++) {
+      if (settleStep(cachedSim.circuit)) { settled = true; break; }
+    }
+  } catch (err) {
+    error = String(err);
+  }
+  console.log('settled=' + settled + ' error=' + error, cachedSim.circuit);
+  const states = {};
+  for (const [cellKey, cell] of cells) {
+    const st = {};
+    for (const d of cellPortsOf(cell)) {
+      st[d] = cachedSim.portNodes.get(cellKey + ',' + d).state;
+    }
+    states[cellKey] = st;
+  }
+  return {states, settled, error};
+}
+
+// Settle the circuit locally and recolor the wires.
+function sync() {
+  const result = simulate();
+  simStates = result.states;
+  if (result.error) status.textContent = 'Sim error: ' + result.error;
+  else if (!result.settled) status.textContent = 'Warning: circuit did not settle.';
+  else status.textContent = '';
+  redraw();
+}
+
+// State of this cell's node on the first of the given port directions
+// that is present. Falls back to floating.
+function wireState(st, dirs) {
+  if (st) for (const d of dirs) if (st[d]) return st[d];
+  return 'FLOAT';
+}
+
+// Set stroke/fill for a wire piece on the given ports: state color, and
+// a thicker line when the node is high.
+function setWireStyle(st, dirs) {
+  const state = wireState(st, dirs);
+  ctx.strokeStyle = ctx.fillStyle = WIRE_COLORS[state];
+  ctx.lineWidth = state === 'HIGH' ? 3.5 : 2;
+}
+
+// Back to neutral ink for the non-wire parts of a symbol.
+function setInkStyle() {
+  ctx.strokeStyle = ctx.fillStyle = '#222';
+  ctx.lineWidth = 2;
+}
+
+function drawGrid(x0, y0, x1, y1) {
+  // Grid lines across the visible world rectangle, as screen hairlines.
+  ctx.strokeStyle = '#ddd';
+  ctx.lineWidth = 1 / zoom;
+  ctx.beginPath();
+  for (let c = Math.floor(x0 / CELL); c <= Math.ceil(x1 / CELL); c++) {
+    ctx.moveTo(c * CELL, y0);
+    ctx.lineTo(c * CELL, y1);
+  }
+  for (let r = Math.floor(y0 / CELL); r <= Math.ceil(y1 / CELL); r++) {
+    ctx.moveTo(x0, r * CELL);
+    ctx.lineTo(x1, r * CELL);
+  }
+  ctx.stroke();
+}
+
+// Element drawing. Each draws in cell-local coordinates: the canvas is
+// translated so (0,0) is the cell's top-left corner. cx is the middle.
+const cx = CELL / 2, cy = CELL / 2;
+
+function drawPullup() {
+  // Empty circle (supply) with a short wire down to the resistor body,
+  // then a wire from the resistor down to the bottom middle of the square.
+  ctx.beginPath();
+  ctx.arc(cx, 10, 5, 0, 2 * Math.PI);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx, 15);
+  ctx.lineTo(cx, 22);
+  ctx.stroke();
+  ctx.strokeRect(cx - 7, 22, 14, 26);
+  ctx.beginPath();
+  ctx.moveTo(cx, 48);
+  ctx.lineTo(cx, CELL);
+  ctx.stroke();
+}
+
+function drawGround() {
+  // Wire from the top middle down to the ground symbol.
+  ctx.beginPath();
+  ctx.moveTo(cx, 0);
+  ctx.lineTo(cx, 38);
+  for (const [w, y] of [[14, 38], [9, 44], [4, 50]]) {
+    ctx.moveTo(cx - w, y);
+    ctx.lineTo(cx + w, y);
+  }
+  ctx.stroke();
+}
+
+function drawTransistor(dir, st) {
+  // Drain wire down from the top middle to a third of the cell, bending
+  // sideways toward the gate; same from the bottom for the source. A
+  // vertical channel bar connects the two bent ends, extending a bit
+  // beyond them, and the gate arrow from the side edge touches the bar.
+  // Each of the three leads is colored by its own node; the channel bar
+  // stays neutral ink.
+  const s = dir === 'left' ? -1 : 1;
+  const y1 = CELL / 3, y2 = 2 * CELL / 3;
+  const bx = cx + s * 12;   // x of the channel bar
+  const ext = 6;            // bar overhang beyond the bends
+
+  setWireStyle(st, 'n');    // drain
+  ctx.beginPath();
+  ctx.moveTo(cx, 0);
+  ctx.lineTo(cx, y1);
+  ctx.lineTo(bx, y1);
+  ctx.stroke();
+
+  setWireStyle(st, 's');    // source
+  ctx.beginPath();
+  ctx.moveTo(cx, CELL);
+  ctx.lineTo(cx, y2);
+  ctx.lineTo(bx, y2);
+  ctx.stroke();
+
+  // Gate: wire from the side edge, ending in an arrowhead whose tip
+  // touches the channel bar.
+  setWireStyle(st, dir === 'left' ? 'w' : 'e');
+  const edge = dir === 'left' ? 0 : CELL;
+  ctx.beginPath();
+  ctx.moveTo(edge, cy);
+  ctx.lineTo(bx + s * 9, cy);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(bx, cy);
+  ctx.lineTo(bx + s * 9, cy - 4);
+  ctx.lineTo(bx + s * 9, cy + 4);
+  ctx.closePath();
+  ctx.fill();
+
+  setInkStyle();
+  ctx.beginPath();
+  ctx.moveTo(bx, y1 - ext);
+  ctx.lineTo(bx, y2 + ext);
+  ctx.stroke();
+}
+
+function drawButton(closed, st) {
+  // A knife switch between an upper and a lower contact, matching the
+  // sim's Button with its up and down nodes. The lever pivots on the
+  // lower contact: slanted aside when open, on the upper contact when
+  // closed. Each contact wire is colored by its own node; the lever
+  // stays neutral ink.
+  const top = {x: cx, y: cy - 12};
+  const bot = {x: cx, y: cy + 12};
+  for (const [d, p, edgeY] of [['n', top, 0], ['s', bot, CELL]]) {
+    setWireStyle(st, d);
+    ctx.beginPath();
+    ctx.moveTo(cx, edgeY);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2.5, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  setInkStyle();
+  ctx.beginPath();
+  ctx.moveTo(bot.x, bot.y);
+  if (closed) ctx.lineTo(top.x, top.y);
+  else ctx.lineTo(cx + 14, cy - 8);
+  ctx.stroke();
+}
+
+function drawWires(w, st) {
+  // One wire arm per direction, from the center to the edge middle. A
+  // meeting of three or more arms is a connection and gets a dot;
+  // straights and turns (two arms) just join. All arms are one node, so
+  // the whole cell takes that node's color.
+  const arms = {n: [cx, 0], w: [0, cy], e: [CELL, cy], s: [cx, CELL]};
+  setWireStyle(st, 'nwes');
+  let count = 0;
+  ctx.beginPath();
+  for (const d of 'nwes') {
+    if (!w[d]) continue;
+    count++;
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(arms[d][0], arms[d][1]);
+  }
+  ctx.stroke();
+  if (count >= 3) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, 3.5, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  if (w.name) {
+    // Centered label, sized to fill at most 2/3 of the square either
+    // way, on a white rectangle to stay readable over the wires.
+    const max = CELL * 2 / 3;
+    let size = max;
+    ctx.font = size + 'px system-ui, sans-serif';
+    if (ctx.measureText(w.name).width > max) {
+      size = size * max / ctx.measureText(w.name).width;
+      ctx.font = size + 'px system-ui, sans-serif';
+    }
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const m = ctx.measureText(w.name);
+    const asc = m.actualBoundingBoxAscent || size * 0.75;
+    const desc = m.actualBoundingBoxDescent || size * 0.1;
+    const pad = 3;
+    const color = ctx.fillStyle;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(cx - m.width / 2 - pad, cy - asc - pad,
+                 m.width + 2 * pad, asc + desc + 2 * pad);
+    ctx.fillStyle = color;
+    ctx.fillText(w.name, cx, cy);
+  }
+}
+
+function drawCross(st) {
+  // Wires crossing without connecting: the vertical goes straight
+  // through, the horizontal hops over it with a small semicircle. The
+  // two lanes are separate nodes and are colored independently.
+  const r = 7;
+  setWireStyle(st, 'ns');
+  ctx.beginPath();
+  ctx.moveTo(cx, 0);
+  ctx.lineTo(cx, CELL);
+  ctx.stroke();
+  setWireStyle(st, 'we');
+  ctx.beginPath();
+  ctx.moveTo(0, cy);
+  ctx.lineTo(cx - r, cy);
+  ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
+  ctx.lineTo(CELL, cy);
+  ctx.stroke();
+}
+
+function redraw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(zoom, 0, 0, zoom, -viewX * zoom, -viewY * zoom);
+  const x0 = viewX, y0 = viewY;
+  const x1 = viewX + canvas.width / zoom, y1 = viewY + canvas.height / zoom;
+  if (hover) {
+    ctx.fillStyle = '#e8f2ff';
+    ctx.fillRect(hover.col * CELL, hover.row * CELL, CELL, CELL);
+  }
+  drawGrid(x0, y0, x1, y1);
+  ctx.lineCap = 'round';
+  for (const [key, cell] of cells) {
+    const [row, col] = key.split(',').map(Number);
+    if ((col + 1) * CELL < x0 || col * CELL > x1 ||
+        (row + 1) * CELL < y0 || row * CELL > y1) continue;
+    const st = simStates ? simStates[key] : null;
+    ctx.save();
+    ctx.translate(col * CELL, row * CELL);
+    setInkStyle();
+    if (cell === 'pullup') drawPullup();
+    else if (cell === 'ground') drawGround();
+    else if (cell === 'cross') drawCross(st);
+    else if (cell === 'btn-open') drawButton(false, st);
+    else if (cell === 'btn-closed') drawButton(true, st);
+    else if (typeof cell === 'object') drawWires(cell, st);
+    else drawTransistor(cell, st);
+    ctx.restore();
+  }
+}
+
+function updateHover() {
+  let h = null;
+  if (lastMouse) {
+    h = {row: Math.floor((viewY + lastMouse.y / zoom) / CELL),
+         col: Math.floor((viewX + lastMouse.x / zoom) / CELL)};
+  }
+  if (!!h !== !!hover || (h && (h.row !== hover.row || h.col !== hover.col))) {
+    hover = h;
+    redraw();
+  }
+}
+
+canvas.addEventListener('mousemove', e => {
+  lastMouse = {x: e.offsetX, y: e.offsetY};
+  updateHover();
+});
+
+canvas.addEventListener('mouseleave', () => { lastMouse = null; updateHover(); });
+
+const KEYS = {p: 'pullup', g: 'ground', l: 'left', r: 'right', x: 'cross',
+              b: 'btn-open', ' ': null};
+const ARM_KEYS = {w: 'n', a: 'w', s: 's', d: 'e'};
+
+// --- JSON dialog: export the circuit (auto-copied), or paste and
+// replace it. Esc closes the native modal dialog without changes.
+const jsonDialog = document.getElementById('jsonDialog');
+const jsonText = document.getElementById('jsonText');
+const jsonNote = document.getElementById('jsonNote');
+const CELL_VALUES = new Set(['pullup', 'ground', 'left', 'right', 'cross',
+                             'btn-open', 'btn-closed']);
+
+function openJsonDialog() {
+  const text = JSON.stringify(Object.fromEntries(cells), null, 1);
+  jsonText.value = text;
+  jsonNote.textContent = '';
+  jsonDialog.showModal();
+  jsonText.select();
+  navigator.clipboard.writeText(text).then(
+    () => { jsonNote.textContent = 'Copied to clipboard.'; },
+    () => { jsonNote.textContent = 'Auto-copy failed; text is selected, copy it manually.'; });
+}
+
+document.getElementById('replaceBtn').addEventListener('click', () => {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText.value);
+  } catch (err) {
+    jsonNote.textContent = 'Invalid JSON: ' + err.message;
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    jsonNote.textContent = 'Expected an object mapping "row,col" to cells.';
+    return;
+  }
+  const entries = [];
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!/^-?\d+,-?\d+$/.test(key)) {
+      jsonNote.textContent = 'Bad cell key: ' + key;
+      return;
+    }
+    if (typeof value === 'string' && CELL_VALUES.has(value)) {
+      entries.push([key, value]);
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const wire = {n: !!value.n, w: !!value.w, e: !!value.e, s: !!value.s};
+      if (typeof value.name === 'string' && value.name.trim()) {
+        wire.name = value.name.trim().toUpperCase();
+      }
+      if (wire.n || wire.w || wire.e || wire.s) entries.push([key, wire]);
+    } else if (value !== null) {
+      jsonNote.textContent = 'Bad cell value at ' + key + ': ' + JSON.stringify(value);
+      return;
+    }
+  }
+  cells.clear();
+  for (const [key, value] of entries) cells.set(key, value);
+  jsonDialog.close();
+  redraw();
+  sync();
+});
+
+// --- Net name dialog: opened with n over a wire cell; enter applies
+// (an empty name removes it), esc closes without changes.
+const nameDialog = document.getElementById('nameDialog');
+const nameInput = document.getElementById('nameInput');
+let nameTarget = null;   // the wire cell being renamed
+
+function openNameDialog() {
+  const cell = getCell(hover.row, hover.col);
+  if (!cell || typeof cell !== 'object') return;
+  nameTarget = {row: hover.row, col: hover.col};
+  nameInput.value = cell.name || '';
+  nameDialog.showModal();
+  nameInput.select();
+}
+
+nameInput.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const cell = getCell(nameTarget.row, nameTarget.col);
+  if (cell && typeof cell === 'object') {
+    const name = nameInput.value.trim().toUpperCase();
+    if (name) cell.name = name;
+    else delete cell.name;
+  }
+  nameDialog.close();
+  redraw();
+  sync();
+});
+
+const PAN_KEYS = {ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+                  ArrowUp: [0, -1], ArrowDown: [0, 1]};
+
+window.addEventListener('keydown', e => {
+  if (jsonDialog.open || nameDialog.open || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === 'j') {
+    e.preventDefault();
+    openJsonDialog();
+    return;
+  }
+  if (k === 'n' && hover) {
+    e.preventDefault();
+    openNameDialog();
+    return;
+  }
+  // View controls, independent of the hovered square.
+  if (k in PAN_KEYS) {
+    viewX += PAN_KEYS[k][0] * CELL / zoom;
+    viewY += PAN_KEYS[k][1] * CELL / zoom;
+  } else if (k === '+' || k === '=' || k === '-') {
+    zoomBy(k === '-' ? 1 / 1.25 : 1.25);
+  } else if (!hover) {
+    return;
+  } else if (k in KEYS) {
+    setCell(hover.row, hover.col, KEYS[k]);
+  } else if (k === 'Enter') {
+    const cell = getCell(hover.row, hover.col);
+    if (cell === 'btn-open') setCell(hover.row, hover.col, 'btn-closed');
+    else if (cell === 'btn-closed') setCell(hover.row, hover.col, 'btn-open');
+    else return;
+  } else if (k in ARM_KEYS) {
+    // Toggle one wire arm; anything other than a wire cell is replaced.
+    let cell = getCell(hover.row, hover.col);
+    if (!cell || typeof cell !== 'object') cell = {n: false, w: false, e: false, s: false};
+    cell[ARM_KEYS[k]] = !cell[ARM_KEYS[k]];
+    setCell(hover.row, hover.col,
+            (cell.n || cell.w || cell.e || cell.s) ? cell : null);
+  } else {
+    return;
+  }
+  e.preventDefault();
+  if (k in PAN_KEYS || k === '+' || k === '=' || k === '-') {
+    updateHover();
+    redraw();
+  } else {
+    redraw();
+    sync();
+  }
+});
+
+resize();
+sync();
+</script>
+</body>
+</html>
