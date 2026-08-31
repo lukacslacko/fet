@@ -492,8 +492,14 @@ function simulate() {
 
 // ===== end sim =====
 
+// Each card remembers its own scroll position and zoom level.
+function persistView() {
+  state.cards[state.current].view = {x: viewX, y: viewY, zoom: zoom};
+}
+
 function saveState() {
   persistCurrent();
+  persistView();
   try {
     localStorage.setItem('fet-cards', JSON.stringify(state));
   } catch (err) { /* storage full or unavailable; JSON export still works */ }
@@ -939,6 +945,12 @@ function validateState(parsed) {
       }
     }
     out.cards[name] = {cells: cellsOut, test: testOut};
+    const v = card && card.view;
+    if (v && typeof v === 'object' && Number.isFinite(v.x) &&
+        Number.isFinite(v.y) && Number.isFinite(v.zoom)) {
+      out.cards[name].view = {x: v.x, y: v.y,
+                              zoom: Math.min(4, Math.max(0.2, v.zoom))};
+    }
   }
   out.current = (typeof parsed.current === 'string' &&
                  parsed.current in out.cards) ? parsed.current : cardNames[0];
@@ -952,7 +964,7 @@ const jsonText = document.getElementById('jsonText');
 const jsonNote = document.getElementById('jsonNote');
 
 function openJsonDialog() {
-  persistCurrent();
+  saveState();
   const text = JSON.stringify(state, null, 1);
   jsonText.value = text;
   jsonNote.textContent = '';
@@ -1100,6 +1112,10 @@ function refreshCardSelect() {
 function loadCard(name) {
   state.current = name;
   cells = new Map(Object.entries(state.cards[name].cells));
+  const view = state.cards[name].view;
+  viewX = view ? view.x : -CELL / 2;
+  viewY = view ? view.y : -CELL / 2;
+  zoom = view ? view.zoom : 1;
   simStates = null;
   simUnsettled = null;
   testPtr = 0;
@@ -1112,7 +1128,7 @@ function loadCard(name) {
 }
 
 cardSelect.addEventListener('change', () => {
-  persistCurrent();
+  saveState();
   loadCard(cardSelect.value);
   cardSelect.blur();
   redraw();
@@ -1127,7 +1143,7 @@ document.getElementById('newCardBtn').addEventListener('click', e => {
     alert('A card named "' + name + '" already exists.');
     return;
   }
-  persistCurrent();
+  saveState();
   state.cards[name] = {cells: {}};
   loadCard(name);
   redraw();
@@ -1436,6 +1452,7 @@ window.addEventListener('keydown', e => {
   if (k in PAN_KEYS || k === '+' || k === '=' || k === '-') {
     updateHover();
     redraw();
+    saveState();
   } else {
     redraw();
     sync();
