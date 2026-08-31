@@ -27,6 +27,13 @@ out of D-latch cards. State (all cards) lives in browser storage and
 can be exported/imported as JSON with `j`. The simple editor above
 stays as-is as a playground.
 
+Each card can carry a test (`t` opens the test panel): one column per
+pin, one row per step. A cell is either blank (don't drive, don't
+care), `h`/`l` (drive the pin high/low) or `1`/`0` (expect the pin's
+net high/low). Run/Step/Restart execute the rows in order — node
+states persist between rows, so latches can be clocked and then read —
+and the run stops on the failing row.
+
 ## Keys
 
 Point at a square and press:

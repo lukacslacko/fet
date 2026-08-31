@@ -16,6 +16,21 @@
   #jsonText { width: 480px; height: 320px; font-family: monospace; font-size: 12px; }
   #jsonRow, #cardRow { margin-top: 8px; display: flex; gap: 12px; align-items: center; }
   #jsonNote, #cardNote { color: #555; }
+  #mainRow { display: flex; gap: 8px; align-items: flex-start; }
+  #testPanel { flex: none; max-height: calc(100vh - 220px); overflow: auto;
+               border: 1px solid #999; border-radius: 6px; background: #fff;
+               padding: 8px; }
+  #testControls { display: flex; gap: 6px; margin-bottom: 6px; }
+  #testMsg { min-height: 1.2em; margin-bottom: 6px; font-weight: 600; color: #555; }
+  #testTable { border-collapse: collapse; }
+  #testTable th, #testTable td { border: 1px solid #ddd; padding: 2px 3px;
+                                 text-align: center; font-size: 13px; }
+  #testTable input { width: 22px; border: none; text-align: center;
+                     font-family: monospace; font-size: 14px; background: transparent; }
+  #testTable tr.done { background: #e6f4e6; }
+  #testTable tr.cur { background: #e8f2ff; }
+  #testTable tr.fail { background: #fbdcdc; }
+  #testTable .delRow { cursor: pointer; color: #999; border: none; background: none; }
 </style>
 </head>
 <body>
@@ -23,8 +38,21 @@
   <label>Card: <select id="cardSelect"></select></label>
   <button id="newCardBtn">New card</button>
   <button id="delCardBtn">Delete card</button>
+  <button id="testBtn">Tests</button>
 </div>
+<div id="mainRow">
 <canvas id="grid"></canvas>
+<div id="testPanel" hidden>
+  <div id="testControls">
+    <button id="runBtn">Run</button>
+    <button id="stepBtn">Step</button>
+    <button id="restartBtn">Restart</button>
+    <button id="addRowBtn">+ row</button>
+  </div>
+  <div id="testMsg"></div>
+  <table id="testTable"></table>
+</div>
+</div>
 <div id="legend">
   <kbd>p</kbd> pullup &nbsp; <kbd>g</kbd> ground &nbsp;
   <kbd>l</kbd>/<kbd>r</kbd> left/right transistor &nbsp;
@@ -34,7 +62,7 @@
   <kbd>n</kbd> name net &nbsp;
   <kbd>enter</kbd> flip button / cycle pin &nbsp; <kbd>space</kbd> clear &nbsp;
   <kbd>&larr;&uarr;&darr;&rarr;</kbd> scroll &nbsp; <kbd>+</kbd>/<kbd>-</kbd> zoom &nbsp;
-  <kbd>j</kbd> json
+  <kbd>t</kbd> tests &nbsp; <kbd>j</kbd> json
 </div>
 <div id="status"></div>
 <dialog id="nameDialog">
@@ -101,7 +129,9 @@ function setCell(row, col, value) {
 }
 
 function resize() {
-  canvas.width = Math.max(300, window.innerWidth - 34);
+  const panel = document.getElementById('testPanel');
+  const panelW = panel.hidden ? 0 : panel.offsetWidth + 8;
+  canvas.width = Math.max(300, window.innerWidth - 34 - panelW);
   canvas.height = Math.max(300, window.innerHeight - 165);
   redraw();
 }
@@ -403,6 +433,8 @@ function topologyKey() {
 }
 
 let cachedSim = null;   // {key, circuit, portNodes, buttonsByCell, pinsByCell}
+let testDrives = null;  // pin name -> 'high'|'low' while a test drives the
+                        // card; null means the pins' own editor drives apply
 
 function simulate() {
   const key = topologyKey();
@@ -411,7 +443,9 @@ function simulate() {
     if (cell === 'btn-open' || cell === 'btn-closed') {
       cachedSim.buttonsByCell.get(cellKey).pressed = cell === 'btn-closed';
     } else if (cell && cell.pin !== undefined) {
-      cachedSim.pinsByCell.get(cellKey).drive = cell.drive || 'float';
+      cachedSim.pinsByCell.get(cellKey).drive =
+          testDrives ? (testDrives.get(cell.pin) || 'float')
+                     : (cell.drive || 'float');
     }
   }
   let settled = false, error = null;
@@ -465,10 +499,13 @@ function saveState() {
   } catch (err) { /* storage full or unavailable; JSON export still works */ }
 }
 
+let lastSim = null;   // result of the most recent simulate(), for tests
+
 // Settle the circuit, recolor the wires, save to browser storage.
 function sync() {
   saveState();
   const result = simulate();
+  lastSim = result;
   simStates = result.states;
   simUnsettled = result.unsettled || null;
   if (result.error) status.textContent = 'Sim error: ' + result.error;
@@ -889,7 +926,19 @@ function validateState(parsed) {
         throw new Error('bad cell at ' + key + ' in card ' + name);
       }
     }
-    out.cards[name] = {cells: cellsOut};
+    // Test rows: objects mapping pin name to 'h', 'l', '1' or '0'.
+    const testOut = [];
+    if (Array.isArray(card && card.test)) {
+      for (const row of card.test) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+        const rowOut = {};
+        for (const [pin, v] of Object.entries(row)) {
+          if (['h', 'l', '1', '0'].includes(v)) rowOut[pin] = v;
+        }
+        testOut.push(rowOut);
+      }
+    }
+    out.cards[name] = {cells: cellsOut, test: testOut};
   }
   out.current = (typeof parsed.current === 'string' &&
                  parsed.current in out.cards) ? parsed.current : cardNames[0];
@@ -1053,7 +1102,13 @@ function loadCard(name) {
   cells = new Map(Object.entries(state.cards[name].cells));
   simStates = null;
   simUnsettled = null;
+  testPtr = 0;
+  testFailed = false;
+  testFailMsg = '';
+  testDrives = null;
   refreshCardSelect();
+  const panel = document.getElementById('testPanel');
+  if (panel && !panel.hidden) renderTestTable();
 }
 
 cardSelect.addEventListener('change', () => {
@@ -1100,6 +1155,213 @@ document.getElementById('delCardBtn').addEventListener('click', e => {
   sync();
 });
 
+// --- Test panel: a per-card test with one column per pin and one row
+// per step, run in order. Cell values: space = don't drive, don't
+// care; h/l = drive the pin high/low; 1/0 = expect the pin's net high/
+// low. Each step drives the pins as its row says, settles, then checks
+// the expectations; node states persist between rows (so latches can
+// be clocked and then read), and the run stops on the failing row.
+const testPanel = document.getElementById('testPanel');
+const testMsg = document.getElementById('testMsg');
+let testPtr = 0;         // next row to execute
+let testFailed = false;
+let testFailMsg = '';
+
+function currentTest() {
+  const card = state.cards[state.current];
+  if (!card.test) card.test = [];
+  return card.test;
+}
+
+// Unique pin names of the current card, in canonical pin order.
+function testPinNames() {
+  persistCurrent();
+  const seen = new Set();
+  const names = [];
+  for (const pin of collectPins(state.current)) {
+    if (!seen.has(pin.name)) {
+      seen.add(pin.name);
+      names.push(pin.name);
+    }
+  }
+  return names;
+}
+
+function pinNetState(name) {
+  for (const [key, cell] of cells) {
+    if (cell && cell.pin === name) {
+      return (simStates && simStates[key]) ? simStates[key].n : 'FLOAT';
+    }
+  }
+  return 'FLOAT';
+}
+
+function updateTestMsg() {
+  const rows = currentTest();
+  if (testFailed) {
+    testMsg.textContent = testFailMsg;
+    testMsg.style.color = '#c22';
+  } else if (rows.length && testPtr >= rows.length) {
+    testMsg.textContent = 'PASS (' + rows.length + ' rows)';
+    testMsg.style.color = '#2a2';
+  } else if (rows.length) {
+    testMsg.textContent = 'At row ' + (testPtr + 1) + ' of ' + rows.length + '.';
+    testMsg.style.color = '#555';
+  } else {
+    testMsg.textContent = 'No test rows yet; add one with "+ row".';
+    testMsg.style.color = '#555';
+  }
+}
+
+function renderTestTable() {
+  const pins = testPinNames();
+  const rows = currentTest();
+  const table = document.getElementById('testTable');
+  table.innerHTML = '';
+  if (!pins.length) {
+    testMsg.textContent = 'This card has no pins to test.';
+    testMsg.style.color = '#555';
+    return;
+  }
+  const head = document.createElement('tr');
+  head.appendChild(document.createElement('th'));
+  for (const name of pins) {
+    const th = document.createElement('th');
+    th.textContent = name;
+    head.appendChild(th);
+  }
+  head.appendChild(document.createElement('th'));
+  table.appendChild(head);
+  rows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+    if (i === testPtr && testFailed) tr.className = 'fail';
+    else if (i === testPtr) tr.className = 'cur';
+    else if (i < testPtr) tr.className = 'done';
+    const num = document.createElement('td');
+    num.textContent = i + 1;
+    tr.appendChild(num);
+    for (const name of pins) {
+      const td = document.createElement('td');
+      const input = document.createElement('input');
+      input.maxLength = 1;
+      input.value = row[name] || '';
+      input.addEventListener('input', () => {
+        const ch = input.value.trim().toLowerCase();
+        const v = ['h', 'l', '1', '0'].includes(ch) ? ch : '';
+        input.value = v;
+        if (v) row[name] = v;
+        else delete row[name];
+        saveState();
+      });
+      input.addEventListener('focus', () => input.select());
+      td.appendChild(input);
+      tr.appendChild(td);
+    }
+    const del = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.className = 'delRow';
+    btn.textContent = '×';
+    btn.title = 'delete this row';
+    btn.addEventListener('click', () => {
+      rows.splice(i, 1);
+      if (testPtr > i) testPtr--;
+      testPtr = Math.min(testPtr, rows.length);
+      testFailed = false;
+      saveState();
+      renderTestTable();
+    });
+    del.appendChild(btn);
+    tr.appendChild(del);
+    table.appendChild(tr);
+  });
+  updateTestMsg();
+}
+
+function toggleTestPanel() {
+  testPanel.hidden = !testPanel.hidden;
+  if (!testPanel.hidden) renderTestTable();
+  resize();
+}
+
+// Rebuild the circuit from scratch (all nodes floating) and go back to
+// the first row, releasing any test drives.
+function testRestart(rerender = true) {
+  testPtr = 0;
+  testFailed = false;
+  testFailMsg = '';
+  testDrives = null;
+  cachedSim = null;
+  sync();
+  if (rerender) renderTestTable();
+}
+
+// Execute the current row: drive, settle, check. Advances on success,
+// sets testFailed and stays on the row otherwise.
+function testStep() {
+  const rows = currentTest();
+  const pins = testPinNames();
+  if (!pins.length || testPtr >= rows.length) return;
+  testFailed = false;
+  const row = rows[testPtr];
+  testDrives = new Map();
+  for (const name of pins) {
+    if (row[name] === 'h') testDrives.set(name, 'high');
+    else if (row[name] === 'l') testDrives.set(name, 'low');
+  }
+  sync();
+  if (lastSim.error || !lastSim.settled) {
+    testFailed = true;
+    testFailMsg = 'Row ' + (testPtr + 1) + ': circuit did not settle' +
+                  (lastSim.error ? ' (' + lastSim.error + ')' : '') + '.';
+    return;
+  }
+  for (const name of pins) {
+    const want = row[name] === '1' ? 'HIGH' : row[name] === '0' ? 'LOW' : null;
+    if (!want) continue;
+    const got = pinNetState(name);
+    if (got !== want) {
+      testFailed = true;
+      testFailMsg = 'Row ' + (testPtr + 1) + ': ' + name + ' expected ' +
+                    want + ', got ' + got + '.';
+      return;
+    }
+  }
+  testPtr++;
+}
+
+function testRun() {
+  if (testFailed || testPtr >= currentTest().length) testRestart(false);
+  while (testPtr < currentTest().length) {
+    testStep();
+    if (testFailed) break;
+  }
+  renderTestTable();
+}
+
+document.getElementById('testBtn').addEventListener('click', e => {
+  e.target.blur();
+  toggleTestPanel();
+});
+document.getElementById('runBtn').addEventListener('click', e => {
+  e.target.blur();
+  testRun();
+});
+document.getElementById('stepBtn').addEventListener('click', e => {
+  e.target.blur();
+  testStep();
+  renderTestTable();
+});
+document.getElementById('restartBtn').addEventListener('click', e => {
+  e.target.blur();
+  testRestart();
+});
+document.getElementById('addRowBtn').addEventListener('click', e => {
+  e.target.blur();
+  currentTest().push({});
+  saveState();
+  renderTestTable();
+});
+
 const PAN_KEYS = {ArrowLeft: [-1, 0], ArrowRight: [1, 0],
                   ArrowUp: [0, -1], ArrowDown: [0, 1]};
 
@@ -1113,6 +1375,11 @@ window.addEventListener('keydown', e => {
   if (k === 'j') {
     e.preventDefault();
     openJsonDialog();
+    return;
+  }
+  if (k === 't') {
+    e.preventDefault();
+    toggleTestPanel();
     return;
   }
   if (k === 'n' && hover) {
