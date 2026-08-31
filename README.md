@@ -14,6 +14,19 @@ The circuit is kept compressed and encoded in the URL's `?c=` parameter
 on every change, so the address bar is always a shareable save of the
 current work.
 
+## Cards editor
+
+https://lukacslacko.github.io/fet/cards.html (`cards.html`) is a bigger
+editor built on the same simulator: circuits are organized into named
+**cards** with external **pins** (`e`; enter cycles a pin's drive
+between float/high/low for testing). A card can be placed inside
+another card (`c` opens a picker; circular dependencies are refused)
+and appears as a bordered box showing its name and pin names, with a
+wire stub below each pin to build on — so a 4-bit register can be built
+out of D-latch cards. State (all cards) lives in browser storage and
+can be exported/imported as JSON with `j`. The simple editor above
+stays as-is as a playground.
+
 ## Keys
 
 Point at a square and press:
