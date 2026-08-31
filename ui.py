@@ -22,7 +22,11 @@ Run `python ui.py`, then point the mouse at a square and press:
 After every edit the grid is turned into a sim.Circuit (touching cell
 edges become shared nodes) and settled; wires are rendered grey, red or
 black for a floating, high or low node. If the circuit does not settle
-within the iteration cap, a warning is shown instead of looping forever.
+within the iteration cap, a warning is shown instead of looping forever,
+and the still-oscillating nets are marked with an orange halo. The
+circuit is also kept encoded in the URL's ?c= parameter (a compact
+binary format in base64url), so the address bar is always a shareable
+save of the current work.
 """
 
 import http.server
@@ -94,6 +98,7 @@ const cells = new Map();
 let hover = null;      // {row, col} under the mouse, or null
 let lastMouse = null;  // last mouse position in canvas pixels
 let simStates = null;  // 'row,col' -> {dir: 'FLOAT'|'HIGH'|'LOW'} from the server
+let simUnsettled = null;  // 'row,col' -> {dir: true} for oscillating nets
 let syncSeq = 0;       // drop out-of-order sim responses
 
 // View: the world point at the canvas top-left corner, and the scale.
@@ -130,6 +135,7 @@ const status = document.getElementById('status');
 // Send the grid to the server, which builds the sim circuit and settles
 // it; recolor the wires from the node states that come back.
 async function sync() {
+  updateUrl();
   const seq = ++syncSeq;
   let result;
   try {
@@ -142,6 +148,7 @@ async function sync() {
   }
   if (seq !== syncSeq) return;
   simStates = result.states;
+  simUnsettled = result.unsettled || null;
   if (result.error) status.textContent = 'Sim error: ' + result.error;
   else if (!result.settled) status.textContent = 'Warning: circuit did not settle.';
   else status.textContent = '';
@@ -169,6 +176,141 @@ function setInkStyle() {
   ctx.lineWidth = 2;
 }
 
+// True when the given port directions include one whose net has not
+// settled (is still oscillating).
+function unsettledIn(un, dirs) {
+  if (un) for (const d of dirs) if (un[d]) return true;
+  return false;
+}
+
+// Stroke the path built by pathFn, under a wide orange halo when its
+// net has not settled. Call after setWireStyle.
+function strokeWithHalo(un, dirs, pathFn) {
+  if (unsettledIn(un, dirs)) {
+    ctx.save();
+    ctx.strokeStyle = '#fa0';
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    pathFn();
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.beginPath();
+  pathFn();
+  ctx.stroke();
+}
+
+// --- Circuit <-> URL: a compact binary encoding (delta-coded cell
+// positions, one type byte per cell, net names as UTF-8) in base64url,
+// kept in the ?c= parameter so the address bar is always a shareable
+// save of the current circuit. Positions are normalized so the
+// top-left of the circuit encodes as the origin.
+const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const CELL_TYPES = ['pullup', 'ground', 'left', 'right', 'cross',
+                    'btn-open', 'btn-closed'];
+
+function encodeCircuit() {
+  const entries = [...cells.entries()].map(([key, cell]) => {
+    const [r, c] = key.split(',').map(Number);
+    return {r, c, cell};
+  }).sort((a, b) => a.r - b.r || a.c - b.c);
+  if (!entries.length) return '';
+  const minR = entries[0].r;
+  const minC = Math.min(...entries.map(e => e.c));
+  const bytes = [1];   // format version
+  const varint = v => {
+    while (v > 127) { bytes.push((v & 127) | 128); v >>>= 7; }
+    bytes.push(v);
+  };
+  let prevR = 0, prevC = -1;
+  for (const {r, c, cell} of entries) {
+    const nr = r - minR, nc = c - minC;
+    const dr = nr - prevR;
+    varint(dr);
+    varint(dr === 0 ? nc - prevC - 1 : nc);
+    if (typeof cell === 'object') {
+      const mask = (cell.n ? 1 : 0) | (cell.w ? 2 : 0) |
+                   (cell.e ? 4 : 0) | (cell.s ? 8 : 0);
+      bytes.push(16 + mask + (cell.name ? 32 : 0));
+      if (cell.name) {
+        const nb = new TextEncoder().encode(cell.name);
+        varint(nb.length);
+        bytes.push(...nb);
+      }
+    } else {
+      bytes.push(CELL_TYPES.indexOf(cell));
+    }
+    prevR = nr;
+    prevC = nc;
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1] ?? 0, b2 = bytes[i + 2] ?? 0;
+    out += B64URL[b0 >> 2] + B64URL[((b0 & 3) << 4) | (b1 >> 4)];
+    if (i + 1 < bytes.length) out += B64URL[((b1 & 15) << 2) | (b2 >> 6)];
+    if (i + 2 < bytes.length) out += B64URL[b2 & 63];
+  }
+  return out;
+}
+
+function decodeCircuit(text) {
+  const rev = new Map([...B64URL].map((ch, i) => [ch, i]));
+  const bytes = [];
+  for (let i = 0; i < text.length; i += 4) {
+    const q = [...text.slice(i, i + 4)].map(ch => {
+      if (!rev.has(ch)) throw new Error('bad character');
+      return rev.get(ch);
+    });
+    if (q.length < 2) throw new Error('truncated');
+    bytes.push((q[0] << 2) | (q[1] >> 4));
+    if (q.length > 2) bytes.push(((q[1] & 15) << 4) | (q[2] >> 2));
+    if (q.length > 3) bytes.push(((q[2] & 3) << 6) | q[3]);
+  }
+  let pos = 0;
+  if (bytes[pos++] !== 1) throw new Error('unsupported version');
+  const varint = () => {
+    let v = 0, shift = 0, b;
+    do {
+      b = bytes[pos++];
+      if (b === undefined) throw new Error('truncated');
+      v |= (b & 127) << shift;
+      shift += 7;
+    } while (b & 128);
+    return v;
+  };
+  const decoded = new Map();
+  let prevR = 0, prevC = -1;
+  while (pos < bytes.length) {
+    const dr = varint();
+    const r = prevR + dr;
+    const c = dr === 0 ? prevC + 1 + varint() : varint();
+    const t = bytes[pos++];
+    let cell;
+    if (t < CELL_TYPES.length) {
+      cell = CELL_TYPES[t];
+    } else if (t >= 16 && t < 64 && (t & 15)) {
+      cell = {n: !!(t & 1), w: !!(t & 2), e: !!(t & 4), s: !!(t & 8)};
+      if (t & 32) {
+        const len = varint();
+        cell.name = new TextDecoder().decode(
+            new Uint8Array(bytes.slice(pos, pos + len)));
+        pos += len;
+      }
+    } else {
+      throw new Error('bad cell type');
+    }
+    decoded.set(r + ',' + c, cell);
+    prevR = r;
+    prevC = c;
+  }
+  return decoded;
+}
+
+function updateUrl() {
+  const encoded = encodeCircuit();
+  history.replaceState(null, '', encoded ? '?c=' + encoded : location.pathname);
+}
+
 function drawGrid(x0, y0, x1, y1) {
   // Grid lines across the visible world rectangle, as screen hairlines.
   ctx.strokeStyle = '#ddd';
@@ -189,7 +331,7 @@ function drawGrid(x0, y0, x1, y1) {
 // translated so (0,0) is the cell's top-left corner. cx is the middle.
 const cx = CELL / 2, cy = CELL / 2;
 
-function drawPullup() {
+function drawPullup(un) {
   // Empty circle (supply) with a short wire down to the resistor body,
   // then a wire from the resistor down to the bottom middle of the square.
   ctx.beginPath();
@@ -200,10 +342,10 @@ function drawPullup() {
   ctx.lineTo(cx, 22);
   ctx.stroke();
   ctx.strokeRect(cx - 7, 22, 14, 26);
-  ctx.beginPath();
-  ctx.moveTo(cx, 48);
-  ctx.lineTo(cx, CELL);
-  ctx.stroke();
+  strokeWithHalo(un, 's', () => {
+    ctx.moveTo(cx, 48);
+    ctx.lineTo(cx, CELL);
+  });
 }
 
 function drawGround() {
@@ -218,7 +360,7 @@ function drawGround() {
   ctx.stroke();
 }
 
-function drawTransistor(dir, st) {
+function drawTransistor(dir, st, un) {
   // Drain wire down from the top middle to a third of the cell, bending
   // sideways toward the gate; same from the bottom for the source. A
   // vertical channel bar connects the two bent ends, extending a bit
@@ -231,27 +373,28 @@ function drawTransistor(dir, st) {
   const ext = 6;            // bar overhang beyond the bends
 
   setWireStyle(st, 'n');    // drain
-  ctx.beginPath();
-  ctx.moveTo(cx, 0);
-  ctx.lineTo(cx, y1);
-  ctx.lineTo(bx, y1);
-  ctx.stroke();
+  strokeWithHalo(un, 'n', () => {
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, y1);
+    ctx.lineTo(bx, y1);
+  });
 
   setWireStyle(st, 's');    // source
-  ctx.beginPath();
-  ctx.moveTo(cx, CELL);
-  ctx.lineTo(cx, y2);
-  ctx.lineTo(bx, y2);
-  ctx.stroke();
+  strokeWithHalo(un, 's', () => {
+    ctx.moveTo(cx, CELL);
+    ctx.lineTo(cx, y2);
+    ctx.lineTo(bx, y2);
+  });
 
   // Gate: wire from the side edge, ending in an arrowhead whose tip
   // touches the channel bar.
-  setWireStyle(st, dir === 'left' ? 'w' : 'e');
+  const gd = dir === 'left' ? 'w' : 'e';
+  setWireStyle(st, gd);
   const edge = dir === 'left' ? 0 : CELL;
-  ctx.beginPath();
-  ctx.moveTo(edge, cy);
-  ctx.lineTo(bx + s * 9, cy);
-  ctx.stroke();
+  strokeWithHalo(un, gd, () => {
+    ctx.moveTo(edge, cy);
+    ctx.lineTo(bx + s * 9, cy);
+  });
   ctx.beginPath();
   ctx.moveTo(bx, cy);
   ctx.lineTo(bx + s * 9, cy - 4);
@@ -266,7 +409,7 @@ function drawTransistor(dir, st) {
   ctx.stroke();
 }
 
-function drawButton(closed, st) {
+function drawButton(closed, st, un) {
   // A knife switch between an upper and a lower contact, matching the
   // sim's Button with its up and down nodes. The lever pivots on the
   // lower contact: slanted aside when open, on the upper contact when
@@ -276,10 +419,10 @@ function drawButton(closed, st) {
   const bot = {x: cx, y: cy + 12};
   for (const [d, p, edgeY] of [['n', top, 0], ['s', bot, CELL]]) {
     setWireStyle(st, d);
-    ctx.beginPath();
-    ctx.moveTo(cx, edgeY);
-    ctx.lineTo(p.x, p.y);
-    ctx.stroke();
+    strokeWithHalo(un, d, () => {
+      ctx.moveTo(cx, edgeY);
+      ctx.lineTo(p.x, p.y);
+    });
     ctx.beginPath();
     ctx.arc(p.x, p.y, 2.5, 0, 2 * Math.PI);
     ctx.fill();
@@ -292,23 +435,21 @@ function drawButton(closed, st) {
   ctx.stroke();
 }
 
-function drawWires(w, st) {
+function drawWires(w, st, un) {
   // One wire arm per direction, from the center to the edge middle. A
   // meeting of three or more arms is a connection and gets a dot;
   // straights and turns (two arms) just join. All arms are one node, so
   // the whole cell takes that node's color.
   const arms = {n: [cx, 0], w: [0, cy], e: [CELL, cy], s: [cx, CELL]};
+  const present = 'nwes'.split('').filter(d => w[d]);
   setWireStyle(st, 'nwes');
-  let count = 0;
-  ctx.beginPath();
-  for (const d of 'nwes') {
-    if (!w[d]) continue;
-    count++;
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(arms[d][0], arms[d][1]);
-  }
-  ctx.stroke();
-  if (count >= 3) {
+  strokeWithHalo(un, 'nwes', () => {
+    for (const d of present) {
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(arms[d][0], arms[d][1]);
+    }
+  });
+  if (present.length >= 3) {
     ctx.beginPath();
     ctx.arc(cx, cy, 3.5, 0, 2 * Math.PI);
     ctx.fill();
@@ -338,23 +479,23 @@ function drawWires(w, st) {
   }
 }
 
-function drawCross(st) {
+function drawCross(st, un) {
   // Wires crossing without connecting: the vertical goes straight
   // through, the horizontal hops over it with a small semicircle. The
   // two lanes are separate nodes and are colored independently.
   const r = 7;
   setWireStyle(st, 'ns');
-  ctx.beginPath();
-  ctx.moveTo(cx, 0);
-  ctx.lineTo(cx, CELL);
-  ctx.stroke();
+  strokeWithHalo(un, 'ns', () => {
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, CELL);
+  });
   setWireStyle(st, 'we');
-  ctx.beginPath();
-  ctx.moveTo(0, cy);
-  ctx.lineTo(cx - r, cy);
-  ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
-  ctx.lineTo(CELL, cy);
-  ctx.stroke();
+  strokeWithHalo(un, 'we', () => {
+    ctx.moveTo(0, cy);
+    ctx.lineTo(cx - r, cy);
+    ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
+    ctx.lineTo(CELL, cy);
+  });
 }
 
 function redraw() {
@@ -374,16 +515,17 @@ function redraw() {
     if ((col + 1) * CELL < x0 || col * CELL > x1 ||
         (row + 1) * CELL < y0 || row * CELL > y1) continue;
     const st = simStates ? simStates[key] : null;
+    const un = simUnsettled ? simUnsettled[key] : null;
     ctx.save();
     ctx.translate(col * CELL, row * CELL);
     setInkStyle();
-    if (cell === 'pullup') drawPullup();
+    if (cell === 'pullup') drawPullup(un);
     else if (cell === 'ground') drawGround();
-    else if (cell === 'cross') drawCross(st);
-    else if (cell === 'btn-open') drawButton(false, st);
-    else if (cell === 'btn-closed') drawButton(true, st);
-    else if (typeof cell === 'object') drawWires(cell, st);
-    else drawTransistor(cell, st);
+    else if (cell === 'cross') drawCross(st, un);
+    else if (cell === 'btn-open') drawButton(false, st, un);
+    else if (cell === 'btn-closed') drawButton(true, st, un);
+    else if (typeof cell === 'object') drawWires(cell, st, un);
+    else drawTransistor(cell, st, un);
     ctx.restore();
   }
 }
@@ -548,6 +690,12 @@ window.addEventListener('keydown', e => {
   }
 });
 
+try {
+  const fromUrl = new URLSearchParams(location.search).get('c');
+  if (fromUrl) for (const [key, cell] of decodeCircuit(fromUrl)) cells.set(key, cell);
+} catch (err) {
+  alert('Could not read the circuit from the URL: ' + err.message);
+}
 resize();
 sync();
 </script>
@@ -681,9 +829,10 @@ _cached = None  # (topology key, circuit, port_nodes, buttons_by_cell)
 def simulate(cells):
     """Settle the grid's circuit, reusing it across button-only edits.
 
-    Returns (states, settled, error): states maps 'row,col' to a dict
-    from port direction to that node's state name; error is an exception
-    description from the sim, or None.
+    Returns (states, settled, error, unsettled): states maps 'row,col'
+    to a dict from port direction to that node's state name; error is an
+    exception description from the sim, or None; unsettled marks the
+    ports of nets still oscillating when the iteration cap was hit.
     """
     global _cached
     key = topology_key(cells)
@@ -705,13 +854,29 @@ def simulate(cells):
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
 
+    # When the circuit oscillates, find the nets doing it: run a few
+    # more steps and record every port whose node keeps changing.
+    unsettled = {}
+    if not settled and error is None:
+        prev = {p: n.state for p, n in port_nodes.items()}
+        try:
+            for _ in range(4):
+                circuit.settle()
+                for p, n in port_nodes.items():
+                    if n.state != prev[p]:
+                        r, c, d = p
+                        unsettled.setdefault(f"{r},{c}", {})[d] = True
+                        prev[p] = n.state
+        except Exception:
+            pass
+
     print(f"settled={settled} error={error}")
     print(circuit)
 
     states = {f"{r},{c}": {d: port_nodes[(r, c, d)].state.name
                            for d in cell_ports(cell)}
               for (r, c), cell in cells.items()}
-    return states, settled, error
+    return states, settled, error, unsettled
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -728,9 +893,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for key, cell in raw.items():
             r, c = (int(v) for v in key.split(","))
             cells[(r, c)] = cell
-        states, settled, error = simulate(cells)
+        states, settled, error, unsettled = simulate(cells)
         body = json.dumps(
-            {"states": states, "settled": settled, "error": error}).encode()
+            {"states": states, "settled": settled, "error": error,
+             "unsettled": unsettled}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()

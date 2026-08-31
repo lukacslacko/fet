@@ -3,8 +3,10 @@
 A tiny switch-level FET circuit playground. Draw transistors, pullups,
 grounds, buttons and wires on an infinite grid in the browser; a small
 Python server builds the circuit and simulates node states live (grey =
-floating, red = high, black = low). Enough to build and play with a
-flip-flop.
+floating, red = high, black = low; oscillating nets that never settle
+get an orange halo). The circuit is kept encoded in the URL's `?c=`
+parameter, so the address bar is always a shareable save of the current
+work. Enough to build and play with a flip-flop.
 
 ## Run
 

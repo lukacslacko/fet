@@ -12,6 +12,7 @@ import ui
 SERVER_SYNC = """// Send the grid to the server, which builds the sim circuit and settles
 // it; recolor the wires from the node states that come back.
 async function sync() {
+  updateUrl();
   const seq = ++syncSeq;
   let result;
   try {
@@ -24,6 +25,7 @@ async function sync() {
   }
   if (seq !== syncSeq) return;
   simStates = result.states;
+  simUnsettled = result.unsettled || null;
   if (result.error) status.textContent = 'Sim error: ' + result.error;
   else if (!result.settled) status.textContent = 'Warning: circuit did not settle.';
   else status.textContent = '';
@@ -187,6 +189,25 @@ function simulate() {
     error = String(err);
   }
   console.log('settled=' + settled + ' error=' + error, cachedSim.circuit);
+  // When the circuit oscillates, find the nets doing it: run a few
+  // more steps and record every port whose node keeps changing.
+  const unsettled = {};
+  if (!settled && !error) {
+    const prev = new Map();
+    for (const [p, n] of cachedSim.portNodes) prev.set(p, n.state);
+    for (let i = 0; i < 4; i++) {
+      settleStep(cachedSim.circuit);
+      for (const [p, n] of cachedSim.portNodes) {
+        if (n.state !== prev.get(p)) {
+          const cut = p.lastIndexOf(',');
+          const cellKey = p.slice(0, cut);
+          if (!unsettled[cellKey]) unsettled[cellKey] = {};
+          unsettled[cellKey][p.slice(cut + 1)] = true;
+          prev.set(p, n.state);
+        }
+      }
+    }
+  }
   const states = {};
   for (const [cellKey, cell] of cells) {
     const st = {};
@@ -195,13 +216,15 @@ function simulate() {
     }
     states[cellKey] = st;
   }
-  return {states, settled, error};
+  return {states, settled, error, unsettled};
 }
 
-// Settle the circuit locally and recolor the wires.
+// Settle the circuit locally, recolor the wires, refresh the URL.
 function sync() {
+  updateUrl();
   const result = simulate();
   simStates = result.states;
+  simUnsettled = result.unsettled || null;
   if (result.error) status.textContent = 'Sim error: ' + result.error;
   else if (!result.settled) status.textContent = 'Warning: circuit did not settle.';
   else status.textContent = '';
