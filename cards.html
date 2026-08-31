@@ -1194,7 +1194,8 @@ document.getElementById('delCardBtn').addEventListener('click', e => {
 // value. Each step drives the pins as its row says, settles, then
 // checks the observations; node states persist between rows (so
 // latches can be clocked and then read), and the run stops on the
-// failing row.
+// failing row. A circuit that does not settle is not an error by
+// itself; only observing a pin on an oscillating net fails the row.
 const testPanel = document.getElementById('testPanel');
 const testMsg = document.getElementById('testMsg');
 const testTable = document.getElementById('testTable');
@@ -1236,6 +1237,15 @@ function pinNetState(name) {
     }
   }
   return 'FLOAT';
+}
+
+// True when the pin's net is still oscillating after the settle loop.
+function pinUnsettled(name) {
+  if (!simUnsettled) return false;
+  for (const [key, cell] of cells) {
+    if (cell && cell.pin === name && simUnsettled[key]) return true;
+  }
+  return false;
 }
 
 function updateTestMsg() {
@@ -1368,15 +1378,22 @@ function testStep() {
     else if (row[name] === 'a0') testDrives.set(name, 'low');
   }
   sync();
-  if (lastSim.error || !lastSim.settled) {
+  if (lastSim.error) {
     testFailed = true;
-    testFailMsg = 'Row ' + (testPtr + 1) + ': circuit did not settle' +
-                  (lastSim.error ? ' (' + lastSim.error + ')' : '') + '.';
+    testFailMsg = 'Row ' + (testPtr + 1) + ': sim error (' + lastSim.error + ').';
     return;
   }
+  // An unsettled (oscillating) circuit is fine in itself - flip-flops
+  // start out that way - as long as no pin observed in this row sits
+  // on an oscillating net.
   for (const name of pins) {
     const v = row[name];
     if (!v || v[0] !== 'o') continue;
+    if (pinUnsettled(name)) {
+      testFailed = true;
+      testFailMsg = 'Row ' + (testPtr + 1) + ': ' + name + ' did not settle.';
+      return;
+    }
     const want = {'1': 'HIGH', '0': 'LOW', 'f': 'FLOAT'}[v[1]];
     const got = pinNetState(name);
     if (got !== want) {
