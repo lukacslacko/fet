@@ -335,20 +335,63 @@ function strokeWithHalo(un, dirs, pathFn) {
 }
 
 // --- Circuit <-> URL: a compact binary encoding (delta-coded cell
-// positions, one type byte per cell, net names as UTF-8) in base64url,
-// kept in the ?c= parameter so the address bar is always a shareable
-// save of the current circuit. Positions are normalized so the
-// top-left of the circuit encodes as the origin.
+// positions, one type byte per cell, net names as UTF-8), deflated
+// with CompressionStream and base64url-encoded into the ?c= parameter,
+// so the address bar is always a shareable save of the current
+// circuit. A leading '.' (not a base64url character) marks a deflated
+// payload; without it the bytes are the raw encoding, which is what
+// links from before compression carry. Whichever form is shorter is
+// used. Positions are normalized so the top-left of the circuit
+// encodes as the origin.
 const B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 const CELL_TYPES = ['pullup', 'ground', 'left', 'right', 'cross',
                     'btn-open', 'btn-closed'];
 
-function encodeCircuit() {
+function toBase64url(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1] ?? 0, b2 = bytes[i + 2] ?? 0;
+    out += B64URL[b0 >> 2] + B64URL[((b0 & 3) << 4) | (b1 >> 4)];
+    if (i + 1 < bytes.length) out += B64URL[((b1 & 15) << 2) | (b2 >> 6)];
+    if (i + 2 < bytes.length) out += B64URL[b2 & 63];
+  }
+  return out;
+}
+
+function fromBase64url(text) {
+  const rev = new Map([...B64URL].map((ch, i) => [ch, i]));
+  const bytes = [];
+  for (let i = 0; i < text.length; i += 4) {
+    const q = [...text.slice(i, i + 4)].map(ch => {
+      if (!rev.has(ch)) throw new Error('bad character');
+      return rev.get(ch);
+    });
+    if (q.length < 2) throw new Error('truncated');
+    bytes.push((q[0] << 2) | (q[1] >> 4));
+    if (q.length > 2) bytes.push(((q[1] & 15) << 4) | (q[2] >> 2));
+    if (q.length > 3) bytes.push(((q[2] & 3) << 6) | q[3]);
+  }
+  return bytes;
+}
+
+async function deflateBytes(bytes) {
+  const stream = new Blob([new Uint8Array(bytes)]).stream()
+      .pipeThrough(new CompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function inflateBytes(bytes) {
+  const stream = new Blob([new Uint8Array(bytes)]).stream()
+      .pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function circuitBytes() {
   const entries = [...cells.entries()].map(([key, cell]) => {
     const [r, c] = key.split(',').map(Number);
     return {r, c, cell};
   }).sort((a, b) => a.r - b.r || a.c - b.c);
-  if (!entries.length) return '';
+  if (!entries.length) return null;
   const minR = entries[0].r;
   const minC = Math.min(...entries.map(e => e.c));
   const bytes = [1];   // format version
@@ -377,29 +420,25 @@ function encodeCircuit() {
     prevR = nr;
     prevC = nc;
   }
-  let out = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i], b1 = bytes[i + 1] ?? 0, b2 = bytes[i + 2] ?? 0;
-    out += B64URL[b0 >> 2] + B64URL[((b0 & 3) << 4) | (b1 >> 4)];
-    if (i + 1 < bytes.length) out += B64URL[((b1 & 15) << 2) | (b2 >> 6)];
-    if (i + 2 < bytes.length) out += B64URL[b2 & 63];
-  }
-  return out;
+  return bytes;
 }
 
-function decodeCircuit(text) {
-  const rev = new Map([...B64URL].map((ch, i) => [ch, i]));
-  const bytes = [];
-  for (let i = 0; i < text.length; i += 4) {
-    const q = [...text.slice(i, i + 4)].map(ch => {
-      if (!rev.has(ch)) throw new Error('bad character');
-      return rev.get(ch);
-    });
-    if (q.length < 2) throw new Error('truncated');
-    bytes.push((q[0] << 2) | (q[1] >> 4));
-    if (q.length > 2) bytes.push(((q[1] & 15) << 4) | (q[2] >> 2));
-    if (q.length > 3) bytes.push(((q[2] & 3) << 6) | q[3]);
+async function encodeCircuit() {
+  const bytes = circuitBytes();
+  if (!bytes) return '';
+  const plain = toBase64url(bytes);
+  const deflated = '.' + toBase64url(await deflateBytes(bytes));
+  return deflated.length < plain.length ? deflated : plain;
+}
+
+async function decodeCircuit(text) {
+  if (text.startsWith('.')) {
+    return parseCircuitBytes([...await inflateBytes(fromBase64url(text.slice(1)))]);
   }
+  return parseCircuitBytes(fromBase64url(text));
+}
+
+function parseCircuitBytes(bytes) {
   let pos = 0;
   if (bytes[pos++] !== 1) throw new Error('unsupported version');
   const varint = () => {
@@ -440,8 +479,12 @@ function decodeCircuit(text) {
   return decoded;
 }
 
-function updateUrl() {
-  const encoded = encodeCircuit();
+let urlSeq = 0;   // drop out-of-order URL rewrites
+
+async function updateUrl() {
+  const seq = ++urlSeq;
+  const encoded = await encodeCircuit();
+  if (seq !== urlSeq) return;
   history.replaceState(null, '', encoded ? '?c=' + encoded : location.pathname);
 }
 
@@ -824,14 +867,16 @@ window.addEventListener('keydown', e => {
   }
 });
 
-try {
-  const fromUrl = new URLSearchParams(location.search).get('c');
-  if (fromUrl) for (const [key, cell] of decodeCircuit(fromUrl)) cells.set(key, cell);
-} catch (err) {
-  alert('Could not read the circuit from the URL: ' + err.message);
-}
-resize();
-sync();
+(async () => {
+  try {
+    const fromUrl = new URLSearchParams(location.search).get('c');
+    if (fromUrl) for (const [key, cell] of await decodeCircuit(fromUrl)) cells.set(key, cell);
+  } catch (err) {
+    alert('Could not read the circuit from the URL: ' + err.message);
+  }
+  resize();
+  sync();
+})();
 </script>
 </body>
 </html>

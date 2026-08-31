@@ -1,26 +1,18 @@
 # fet
 
-A tiny switch-level FET circuit playground. Draw transistors, pullups,
-grounds, buttons and wires on an infinite grid in the browser; a small
-Python server builds the circuit and simulates node states live (grey =
-floating, red = high, black = low; oscillating nets that never settle
-get an orange halo). The circuit is kept encoded in the URL's `?c=`
-parameter, so the address bar is always a shareable save of the current
-work. Enough to build and play with a flip-flop.
+A tiny switch-level FET circuit playground in a single HTML page. Draw
+transistors, pullups, grounds, buttons and wires on an infinite grid;
+the embedded simulator recomputes node states live (grey = floating,
+red = high, black = low; oscillating nets that never settle get an
+orange halo). Enough to build and play with a flip-flop.
 
-## Run
+Use it at https://lukacslacko.github.io/fet/ or just open `index.html`
+locally — everything (UI and simulator) is embedded in that one file,
+no server and no dependencies.
 
-```
-python3 ui.py
-```
-
-then open http://localhost:8000 (it opens automatically). No
-dependencies beyond the Python standard library.
-
-Or use the serverless single-page version, `index.html` — the same UI
-with the simulator ported to JavaScript, hosted at
-https://lukacslacko.github.io/fet/ (or open the file locally). It is
-generated from `ui.py` by `make_index.py`; regenerate after changes.
+The circuit is kept compressed and encoded in the URL's `?c=` parameter
+on every change, so the address bar is always a shareable save of the
+current work.
 
 ## Keys
 
@@ -34,13 +26,14 @@ Point at a square and press:
 - `j` JSON dialog to export/import the circuit
 - arrows scroll, `+`/`-` zoom
 
-## Files
+## The simulator
 
-- `sim.py` — the simulator: each settle step samples conduction, merges
-  nodes connected through conducting channels, and recomputes every
-  node's state (ground beats pullup beats floating).
-- `ui.py` — the web UI and the grid-to-circuit builder.
-- `sim_handwritten.py` — an earlier hand-written incremental simulator,
-  kept for reference.
-- `make_index.py` / `index.html` — generator for and result of the
-  static single-page version (JavaScript simulator embedded).
+Each settle step samples conduction (transistor gates, button
+positions) from the current node states, merges nodes connected through
+conducting channels, and recomputes every node from scratch: a group is
+low if it touches a ground, else high if it touches a pullup, else
+floating. Steps repeat until nothing changes; a symmetric latch with no
+tie-breaker oscillates forever and is reported as unsettled — like real
+hardware, it needs one set/reset pulse. Node states persist across
+button presses (the circuit is only rebuilt when the wiring changes),
+which is what gives a flip-flop its memory.
