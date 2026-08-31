@@ -72,7 +72,8 @@ const ctx = canvas.getContext('2d');
 //     an optional string 'name'; wires sharing a name are one net
 //   - a pin object {pin: NAME, drive: 'float'|'high'|'low'} - an
 //     external pin of this card, connecting at its top and bottom
-//     edges, drivable while editing for testing
+//     edges, drivable while editing for testing; the pin name doubles
+//     as a net name, joining any net named the same
 //   - a card object {card: NAME} - an instance of another card,
 //     anchored at its top-left; it occupies 2 rows by max(1, #pins)
 //     columns, and each pin connects at the bottom edge of its column
@@ -249,15 +250,17 @@ function buildCircuit() {
         }
       }
     }
-    // Named nets, scoped to this card instance.
+    // Named nets, scoped to this card instance. A pin's name is a net
+    // name too, so anything on the net named like a pin is connected
+    // to that pin without running a wire to it.
     const named = new Map();
     for (const [key, cell] of entries) {
-      if (typeof cell === 'object' && !cell.card && cell.name &&
-          cellPortsOf(cell).length) {
-        const anchor = prefix + key + ',' + cellPortsOf(cell)[0];
-        if (named.has(cell.name)) union(named.get(cell.name), anchor);
-        else named.set(cell.name, anchor);
-      }
+      if (!cell || typeof cell !== 'object' || cell.card) continue;
+      const netName = cell.pin !== undefined ? cell.pin : cell.name;
+      if (!netName || !cellPortsOf(cell).length) continue;
+      const anchor = prefix + key + ',' + cellPortsOf(cell)[0];
+      if (named.has(netName)) union(named.get(netName), anchor);
+      else named.set(netName, anchor);
     }
     // Elements, and recursion into instances.
     for (const [key, cell] of entries) {
