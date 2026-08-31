@@ -508,9 +508,14 @@ function drawGrid(x0, y0, x1, y1) {
 // translated so (0,0) is the cell's top-left corner. cx is the middle.
 const cx = CELL / 2, cy = CELL / 2;
 
-function drawPullup(un) {
+function drawPullup(st, un) {
   // Empty circle (supply) with a short wire down to the resistor body,
-  // then a wire from the resistor down to the bottom middle of the square.
+  // then a wire from the resistor down to the bottom middle of the
+  // square. The supply circle and its wire are always live, so always
+  // red; the resistor body and the lead below follow the node: all red
+  // when it is high, but a pulled-down pullup keeps an ink resistor
+  // over its low (black) wire.
+  ctx.strokeStyle = WIRE_COLORS.HIGH;
   ctx.beginPath();
   ctx.arc(cx, 10, 5, 0, 2 * Math.PI);
   ctx.stroke();
@@ -518,7 +523,9 @@ function drawPullup(un) {
   ctx.moveTo(cx, 15);
   ctx.lineTo(cx, 22);
   ctx.stroke();
+  ctx.strokeStyle = wireState(st, 's') === 'HIGH' ? WIRE_COLORS.HIGH : '#222';
   ctx.strokeRect(cx - 7, 22, 14, 26);
+  setWireStyle(st, 's');
   strokeWithHalo(un, 's', () => {
     ctx.moveTo(cx, 48);
     ctx.lineTo(cx, CELL);
@@ -696,7 +703,7 @@ function redraw() {
     ctx.save();
     ctx.translate(col * CELL, row * CELL);
     setInkStyle();
-    if (cell === 'pullup') drawPullup(un);
+    if (cell === 'pullup') drawPullup(st, un);
     else if (cell === 'ground') drawGround();
     else if (cell === 'cross') drawCross(st, un);
     else if (cell === 'btn-open') drawButton(false, st, un);
