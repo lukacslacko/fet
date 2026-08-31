@@ -17,16 +17,22 @@
   #jsonRow, #cardRow { margin-top: 8px; display: flex; gap: 12px; align-items: center; }
   #jsonNote, #cardNote { color: #555; }
   #mainRow { display: flex; gap: 8px; align-items: flex-start; }
-  #testPanel { flex: none; max-height: calc(100vh - 220px); overflow: auto;
+  #testPanel { flex: none; max-width: min(45vw, 560px);
+               max-height: calc(100vh - 220px); overflow: auto;
                border: 1px solid #999; border-radius: 6px; background: #fff;
                padding: 8px; }
   #testControls { display: flex; gap: 6px; margin-bottom: 6px; }
+  #testHint { color: #777; font-size: 12px; margin-bottom: 6px; }
   #testMsg { min-height: 1.2em; margin-bottom: 6px; font-weight: 600; color: #555; }
   #testTable { border-collapse: collapse; }
   #testTable th, #testTable td { border: 1px solid #ddd; padding: 2px 3px;
                                  text-align: center; font-size: 13px; }
-  #testTable input { width: 22px; border: none; text-align: center;
-                     font-family: monospace; font-size: 14px; background: transparent; }
+  #testTable td[data-pin] { cursor: pointer; padding: 2px; }
+  #testTable td[data-pin]:hover { background: #cfe3ff; }
+  .tcell { display: inline-block; min-width: 14px; padding: 0 3px;
+           line-height: 17px; border: 2px solid transparent; border-radius: 4px;
+           font-family: monospace; font-size: 13px; font-weight: 600; }
+  .tcell.none { color: #bbb; font-weight: 400; }
   #testTable tr.done { background: #e6f4e6; }
   #testTable tr.cur { background: #e8f2ff; }
   #testTable tr.fail { background: #fbdcdc; }
@@ -49,6 +55,9 @@
     <button id="restartBtn">Restart</button>
     <button id="addRowBtn">+ row</button>
   </div>
+  <div id="testHint">Hover a cell &mdash; <kbd>a</kbd> assert (filled)
+    <kbd>o</kbd> observe (outline) <kbd>space</kbd> don't care &middot;
+    <kbd>0</kbd> <kbd>1</kbd> <kbd>f</kbd> value</div>
   <div id="testMsg"></div>
   <table id="testTable"></table>
 </div>
@@ -889,6 +898,9 @@ const KEYS = {p: 'pullup', g: 'ground', l: 'left', r: 'right', x: 'cross',
 const ARM_KEYS = {w: 'n', a: 'w', s: 's', d: 'e'};
 const CELL_VALUES = new Set(['pullup', 'ground', 'left', 'right', 'cross',
                              'btn-open', 'btn-closed']);
+// Migration of the old one-char test values: h/l drove the pin high/
+// low, 1/0 expected the net high/low.
+const TEST_LEGACY = {h: 'a1', l: 'a0', '1': 'o1', '0': 'o0'};
 
 // Whole-state validation, shared by the JSON dialog and storage load.
 // Returns a normalized state or throws with a reason.
@@ -932,14 +944,17 @@ function validateState(parsed) {
         throw new Error('bad cell at ' + key + ' in card ' + name);
       }
     }
-    // Test rows: objects mapping pin name to 'h', 'l', '1' or '0'.
+    // Test rows: objects mapping pin name to a mode+value pair, 'a'
+    // (assert, drive the pin) or 'o' (observe, check its net) plus
+    // '0', '1' or 'f'. Legacy one-char values are migrated.
     const testOut = [];
     if (Array.isArray(card && card.test)) {
       for (const row of card.test) {
         if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
         const rowOut = {};
         for (const [pin, v] of Object.entries(row)) {
-          if (['h', 'l', '1', '0'].includes(v)) rowOut[pin] = v;
+          if (/^[ao][01f]$/.test(v)) rowOut[pin] = v;
+          else if (v in TEST_LEGACY) rowOut[pin] = TEST_LEGACY[v];
         }
         testOut.push(rowOut);
       }
@@ -1172,16 +1187,27 @@ document.getElementById('delCardBtn').addEventListener('click', e => {
 });
 
 // --- Test panel: a per-card test with one column per pin and one row
-// per step, run in order. Cell values: space = don't drive, don't
-// care; h/l = drive the pin high/low; 1/0 = expect the pin's net high/
-// low. Each step drives the pins as its row says, settles, then checks
-// the expectations; node states persist between rows (so latches can
-// be clocked and then read), and the run stops on the failing row.
+// per step, run in order. Each cell asserts (drives the pin), observes
+// (checks the pin's net) or doesn't care; the value is 0, 1 or f for
+// float (asserting f releases the pin). Cells are edited like the
+// grid: hover one and press a/o/space for the mode, 0/1/f for the
+// value. Each step drives the pins as its row says, settles, then
+// checks the observations; node states persist between rows (so
+// latches can be clocked and then read), and the run stops on the
+// failing row.
 const testPanel = document.getElementById('testPanel');
 const testMsg = document.getElementById('testMsg');
+const testTable = document.getElementById('testTable');
 let testPtr = 0;         // next row to execute
 let testFailed = false;
 let testFailMsg = '';
+let testHover = null;    // {row, pin, td} of the hovered value cell
+
+testTable.addEventListener('mouseover', e => {
+  const td = e.target.closest('td[data-pin]');
+  testHover = td ? {row: +td.dataset.row, pin: td.dataset.pin, td} : null;
+});
+testTable.addEventListener('mouseleave', () => { testHover = null; });
 
 function currentTest() {
   const card = state.cards[state.current];
@@ -1229,14 +1255,40 @@ function updateTestMsg() {
   }
 }
 
+const TEST_COLORS = {'1': '#d22', '0': '#000', 'f': '#999'};
+
+// Draw one test value cell: a filled chip for assert (drive), an
+// outlined one for observe (check), colored by value like the wires;
+// a faint dot for don't care.
+function paintTestCell(td, value) {
+  td.textContent = '';
+  const chip = document.createElement('span');
+  chip.className = 'tcell' + (value ? '' : ' none');
+  if (!value) {
+    chip.textContent = '·';
+  } else {
+    const color = TEST_COLORS[value[1]];
+    chip.textContent = value[1];
+    if (value[0] === 'a') {
+      chip.style.background = color;
+      chip.style.borderColor = color;
+      chip.style.color = '#fff';
+    } else {
+      chip.style.borderColor = color;
+      chip.style.color = color;
+    }
+  }
+  td.appendChild(chip);
+}
+
 function renderTestTable() {
   const pins = testPinNames();
   const rows = currentTest();
-  const table = document.getElementById('testTable');
-  table.innerHTML = '';
+  testTable.innerHTML = '';
   if (!pins.length) {
     testMsg.textContent = 'This card has no pins to test.';
     testMsg.style.color = '#555';
+    resize();
     return;
   }
   const head = document.createElement('tr');
@@ -1247,7 +1299,7 @@ function renderTestTable() {
     head.appendChild(th);
   }
   head.appendChild(document.createElement('th'));
-  table.appendChild(head);
+  testTable.appendChild(head);
   rows.forEach((row, i) => {
     const tr = document.createElement('tr');
     if (i === testPtr && testFailed) tr.className = 'fail';
@@ -1258,19 +1310,9 @@ function renderTestTable() {
     tr.appendChild(num);
     for (const name of pins) {
       const td = document.createElement('td');
-      const input = document.createElement('input');
-      input.maxLength = 1;
-      input.value = row[name] || '';
-      input.addEventListener('input', () => {
-        const ch = input.value.trim().toLowerCase();
-        const v = ['h', 'l', '1', '0'].includes(ch) ? ch : '';
-        input.value = v;
-        if (v) row[name] = v;
-        else delete row[name];
-        saveState();
-      });
-      input.addEventListener('focus', () => input.select());
-      td.appendChild(input);
+      td.dataset.row = i;
+      td.dataset.pin = name;
+      paintTestCell(td, row[name] || null);
       tr.appendChild(td);
     }
     const del = document.createElement('td');
@@ -1288,15 +1330,16 @@ function renderTestTable() {
     });
     del.appendChild(btn);
     tr.appendChild(del);
-    table.appendChild(tr);
+    testTable.appendChild(tr);
   });
   updateTestMsg();
+  resize();  // the table's width may have changed
 }
 
 function toggleTestPanel() {
   testPanel.hidden = !testPanel.hidden;
   if (!testPanel.hidden) renderTestTable();
-  resize();
+  else resize();
 }
 
 // Rebuild the circuit from scratch (all nodes floating) and go back to
@@ -1321,8 +1364,8 @@ function testStep() {
   const row = rows[testPtr];
   testDrives = new Map();
   for (const name of pins) {
-    if (row[name] === 'h') testDrives.set(name, 'high');
-    else if (row[name] === 'l') testDrives.set(name, 'low');
+    if (row[name] === 'a1') testDrives.set(name, 'high');
+    else if (row[name] === 'a0') testDrives.set(name, 'low');
   }
   sync();
   if (lastSim.error || !lastSim.settled) {
@@ -1332,8 +1375,9 @@ function testStep() {
     return;
   }
   for (const name of pins) {
-    const want = row[name] === '1' ? 'HIGH' : row[name] === '0' ? 'LOW' : null;
-    if (!want) continue;
+    const v = row[name];
+    if (!v || v[0] !== 'o') continue;
+    const want = {'1': 'HIGH', '0': 'LOW', 'f': 'FLOAT'}[v[1]];
     const got = pinNetState(name);
     if (got !== want) {
       testFailed = true;
@@ -1373,7 +1417,8 @@ document.getElementById('restartBtn').addEventListener('click', e => {
 });
 document.getElementById('addRowBtn').addEventListener('click', e => {
   e.target.blur();
-  currentTest().push({});
+  const rows = currentTest();
+  rows.push(rows.length ? {...rows[rows.length - 1]} : {});
   saveState();
   renderTestTable();
 });
@@ -1396,6 +1441,23 @@ window.addEventListener('keydown', e => {
   if (k === 't') {
     e.preventDefault();
     toggleTestPanel();
+    return;
+  }
+  // Editing the hovered test cell: a/o/space pick the mode, 0/1/f the
+  // value (a value key on a don't-care cell starts an assert).
+  if (testHover && !testPanel.hidden && testHover.td.isConnected &&
+      ['a', 'o', ' ', '0', '1', 'f'].includes(k)) {
+    e.preventDefault();
+    const row = currentTest()[testHover.row];
+    if (!row) return;
+    const cur = row[testHover.pin] || null;
+    const next = k === ' ' ? null
+        : (k === 'a' || k === 'o') ? k + (cur ? cur[1] : '0')
+        : (cur ? cur[0] : 'a') + k;
+    if (next) row[testHover.pin] = next;
+    else delete row[testHover.pin];
+    saveState();
+    paintTestCell(testHover.td, next);
     return;
   }
   if (k === 'n' && hover) {
