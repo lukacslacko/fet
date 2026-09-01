@@ -45,6 +45,7 @@
   <button id="newCardBtn">New card</button>
   <button id="delCardBtn">Delete card</button>
   <button id="testBtn">Tests</button>
+  <label><input type="checkbox" id="physBox"> physical</label>
 </div>
 <div id="mainRow">
 <canvas id="grid"></canvas>
@@ -416,6 +417,144 @@ function settleStep(circuit) {
   return !changed;
 }
 
+// ===== physical sim =====
+// DC operating point solver, used when the "physical" checkbox is on.
+// The FET numbers follow the 2N7000 datasheet: 2V gate threshold, a
+// 0.6V body diode from source to drain, and a square-law channel with
+// K = 0.05 A/V^2, which matches Id(on) >= 75mA at Vgs = 4.5V and an
+// on-resistance of a few ohms (1/(2K(4.6-2)) ~ 3.8 ohm); channel-
+// length modulation is ignored. Pullups are 10k to a 4.6V rail.
+const PHYS = {
+  VDD: 4.6,     // supply rail [V]
+  VTH: 2.0,     // gate threshold [V]
+  VBD: 0.6,     // body diode drop, source above drain [V]
+  RPU: 10e3,    // pullup resistor [ohm]
+  K: 0.05,      // square-law channel constant [A/V^2]
+  RDIO: 0.6,    // body diode slope resistance [ohm]
+  GLEAK: 1e-8,  // leak to ground on every node (100 Mohm)
+};
+
+// Voltage to color: black at 0V through orange to the usual red at
+// the rail, so intermediate (analog) levels stand out.
+function voltColor(v) {
+  const t = Math.max(0, Math.min(1, v / PHYS.VDD));
+  const mix = (a, b, u) => Math.round(a + (b - a) * u);
+  const [r, g, b] = t < 0.5
+      ? [mix(0, 230, 2 * t), mix(0, 140, 2 * t), 0]
+      : [mix(230, 210, 2 * t - 1), mix(140, 34, 2 * t - 1), mix(0, 34, 2 * t - 1)];
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+// Channel plus body diode current through one FET, positive from
+// drain to source, with a conductance scale for the relaxation step.
+// The channel is symmetric (whichever terminal is lower acts as the
+// source); the body diode sits from the source terminal to the drain.
+function fetCurrent(vg, vs, vd) {
+  let i = 0, g = 0;
+  const vov = vg - Math.min(vs, vd) - PHYS.VTH;
+  const vds = Math.abs(vd - vs);
+  if (vov > 0) {
+    const ich = vds < vov ? PHYS.K * (2 * vov - vds) * vds
+                          : PHYS.K * vov * vov;
+    i = vd >= vs ? ich : -ich;
+    g = vds > 1e-6 ? ich / vds : 2 * PHYS.K * vov;
+  }
+  const vsd = vs - vd;
+  if (vsd > PHYS.VBD) {
+    i -= (vsd - PHYS.VBD) / PHYS.RDIO;
+    g += 1 / PHYS.RDIO;
+  }
+  return {i, g};
+}
+
+// Find the DC equilibrium of the circuit by damped per-node
+// relaxation with adaptive step sizes (a node whose step flips sign
+// halves it), starting from the previous solution so bistable
+// circuits keep their state; an inverter loop settles at its
+// metastable midpoint. Closed buttons short their nodes; grounds and
+// driven pins are held fixed. Writes each node's voltage as .v.
+function solvePhysical(circuit) {
+  const nodes = new Set();
+  for (const t of circuit.transistors) {
+    nodes.add(t.source); nodes.add(t.gate); nodes.add(t.drain);
+  }
+  for (const p of circuit.pullups) nodes.add(p.node);
+  for (const g of circuit.grounds) nodes.add(g.node);
+  for (const b of circuit.buttons) { nodes.add(b.up); nodes.add(b.down); }
+  for (const p of circuit.pins) nodes.add(p.node);
+
+  const parent = new Map();
+  for (const n of nodes) parent.set(n, n);
+  const find = n => {
+    while (parent.get(n) !== n) {
+      parent.set(n, parent.get(parent.get(n)));
+      n = parent.get(n);
+    }
+    return n;
+  };
+  for (const b of circuit.buttons) {
+    if (b.pressed) parent.set(find(b.up), find(b.down));
+  }
+
+  const fixed = new Map();
+  for (const g of circuit.grounds) fixed.set(find(g.node), 0);
+  for (const p of circuit.pins) {
+    if (p.drive === 'low') fixed.set(find(p.node), 0);
+  }
+  for (const p of circuit.pins) {
+    if (p.drive === 'high' && !fixed.has(find(p.node))) {
+      fixed.set(find(p.node), PHYS.VDD);
+    }
+  }
+
+  const V = new Map(), scale = new Map(), lastStep = new Map();
+  for (const n of nodes) {
+    const r = find(n);
+    if (V.has(r)) continue;
+    V.set(r, fixed.has(r) ? fixed.get(r)
+        : typeof n.v === 'number' ? n.v : n.state === 'HIGH' ? PHYS.VDD : 0);
+    scale.set(r, 0.5);
+    lastStep.set(r, 0);
+  }
+
+  const I = new Map(), G = new Map();
+  for (let iter = 0; iter < 1500; iter++) {
+    for (const r of V.keys()) {
+      I.set(r, -PHYS.GLEAK * V.get(r));
+      G.set(r, PHYS.GLEAK);
+    }
+    for (const p of circuit.pullups) {
+      const r = find(p.node);
+      I.set(r, I.get(r) + (PHYS.VDD - V.get(r)) / PHYS.RPU);
+      G.set(r, G.get(r) + 1 / PHYS.RPU);
+    }
+    for (const t of circuit.transistors) {
+      const rs = find(t.source), rd = find(t.drain);
+      const {i, g} = fetCurrent(V.get(find(t.gate)), V.get(rs), V.get(rd));
+      I.set(rs, I.get(rs) + i);
+      I.set(rd, I.get(rd) - i);
+      G.set(rs, G.get(rs) + g);
+      G.set(rd, G.get(rd) + g);
+    }
+    let worst = 0;
+    for (const r of V.keys()) {
+      if (fixed.has(r)) continue;
+      const want = Math.max(-2, Math.min(2, I.get(r) / G.get(r)));
+      const s = want * lastStep.get(r) < 0
+          ? Math.max(1e-3, scale.get(r) / 2)
+          : Math.min(0.6, scale.get(r) * 1.2);
+      scale.set(r, s);
+      lastStep.set(r, want);
+      V.set(r, Math.max(-1, Math.min(PHYS.VDD + 1, V.get(r) + s * want)));
+      worst = Math.max(worst, Math.abs(s * want));
+    }
+    if (worst < 1e-3) break;
+  }
+  for (const n of nodes) n.v = V.get(find(n));
+}
+
+// ===== end physical sim =====
+
 // Structure of every card, with button positions and pin drives
 // collapsed away: edits that only flip buttons or cycle pin drives
 // reuse the circuit, so a flip-flop keeps its memory.
@@ -444,6 +583,7 @@ function topologyKey() {
 let cachedSim = null;   // {key, circuit, portNodes, buttonsByCell, pinsByCell}
 let testDrives = null;  // pin name -> 'high'|'low' while a test drives the
                         // card; null means the pins' own editor drives apply
+let physical = false;   // show the physical (voltage) sim of the circuit
 
 function simulate() {
   const key = topologyKey();
@@ -486,8 +626,13 @@ function simulate() {
       }
     }
   }
+  if (physical && !error) {
+    try { solvePhysical(cachedSim.circuit); }
+    catch (err) { error = String(err); }
+  }
   // Port states of the card being edited, including the bottom-edge
-  // ports of card instances (used to color their pin names).
+  // ports of card instances (used to color their pin names). In
+  // physical mode each port also carries its node voltage as e.g. nV.
   const states = {};
   for (const [p, node] of cachedSim.portNodes) {
     if (p.includes('#')) continue;
@@ -495,6 +640,9 @@ function simulate() {
     const cellKey = p.slice(0, cut);
     if (!states[cellKey]) states[cellKey] = {};
     states[cellKey][p.slice(cut + 1)] = node.state;
+    if (physical && typeof node.v === 'number') {
+      states[cellKey][p.slice(cut + 1) + 'V'] = node.v;
+    }
   }
   return {states, settled, error, unsettled};
 }
@@ -536,9 +684,25 @@ function wireState(st, dirs) {
   return 'FLOAT';
 }
 
+// Voltage of this cell's node on the first present port direction, or
+// null when the physical sim has no value for it.
+function wireVolt(st, dirs) {
+  if (st) for (const d of dirs) if (st[d + 'V'] !== undefined) return st[d + 'V'];
+  return null;
+}
+
 // Set stroke/fill for a wire piece on the given ports: state color, and
-// a thicker line when the node is high.
+// a thicker line when the node is high. In physical mode the color and
+// width follow the node voltage instead.
 function setWireStyle(st, dirs) {
+  if (physical) {
+    const v = wireVolt(st, dirs);
+    if (v !== null) {
+      ctx.strokeStyle = ctx.fillStyle = voltColor(v);
+      ctx.lineWidth = 2 + 1.5 * Math.max(0, Math.min(1, v / PHYS.VDD));
+      return;
+    }
+  }
   const state = wireState(st, dirs);
   ctx.strokeStyle = ctx.fillStyle = WIRE_COLORS[state];
   ctx.lineWidth = state === 'HIGH' ? 3.5 : 2;
@@ -630,6 +794,45 @@ function drawGrid(x0, y0, x1, y1) {
 // Element drawing. Each draws in cell-local coordinates: the canvas is
 // translated so (0,0) is the cell's top-left corner. cx is the middle.
 const cx = CELL / 2, cy = CELL / 2;
+
+// Physical-mode voltage label at one edge port, in cell-local
+// coordinates: a small number just inside the edge, rotated so its
+// bottom faces the cell center, sitting to the right of the wire it
+// labels. [x, y, rotation] per direction.
+const VOLT_POS = {n: [cx, 0, 0], s: [cx, CELL, Math.PI],
+                  w: [0, cy, -Math.PI / 2], e: [CELL, cy, Math.PI / 2]};
+
+function drawVoltLabel(d, v) {
+  const [x, y, rot] = VOLT_POS[d];
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.font = '9px system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = voltColor(v);
+  ctx.fillText((Math.abs(v) < 0.05 ? 0 : v).toFixed(1), 3, 11);
+  ctx.restore();
+}
+
+// Labels for every port of the cell at key. An edge crossing shared
+// with a neighboring port is labeled only once, by the cell whose
+// port faces north or west.
+function drawVoltLabels(key, st) {
+  const [row, col] = key.split(',').map(Number);
+  for (const d of 'nwes') {
+    const v = st[d + 'V'];
+    if (v === undefined) continue;
+    if (d === 's') {
+      const below = simStates[(row + 1) + ',' + col];
+      if (below && below.nV !== undefined) continue;
+    } else if (d === 'e') {
+      const right = simStates[row + ',' + (col + 1)];
+      if (right && right.wV !== undefined) continue;
+    }
+    drawVoltLabel(d, v);
+  }
+}
 
 function drawPullup(st, un) {
   // Empty circle (supply) with a short wire down to the resistor body,
@@ -824,9 +1027,11 @@ function drawInstance(name, row, col) {
   fitTextCentered(name, x + w / 2, y + CELL / 2, w - 16, CELL * 0.6);
   pins.forEach((pin, i) => {
     const key = (row + 1) + ',' + (col + i);
-    const stt = simStates && simStates[key] ? simStates[key].s : null;
+    const st = simStates ? simStates[key] : null;
     const unn = simUnsettled && simUnsettled[key] && simUnsettled[key].s;
-    ctx.fillStyle = unn ? '#fa0' : WIRE_COLORS[stt || 'FLOAT'];
+    ctx.fillStyle = unn ? '#fa0'
+        : physical && st && st.sV !== undefined ? voltColor(st.sV)
+        : WIRE_COLORS[(st && st.s) || 'FLOAT'];
     fitTextCentered(pin.name, x + (i + 0.5) * CELL, y + CELL * 1.5,
                     CELL - 10, CELL * 0.5);
   });
@@ -853,6 +1058,21 @@ function redraw() {
       ctx.save();
       drawInstance(cell.card, row, col);
       ctx.restore();
+      // Voltage labels on the instance's bottom-edge pin ports, unless
+      // the wire cell below labels the same crossing already.
+      if (physical && simStates) {
+        for (let i = 0; i < n; i++) {
+          const pst = simStates[(row + 1) + ',' + (col + i)];
+          const below = simStates[(row + 2) + ',' + (col + i)];
+          if (pst && pst.sV !== undefined &&
+              !(below && below.nV !== undefined)) {
+            ctx.save();
+            ctx.translate((col + i) * CELL, (row + 1) * CELL);
+            drawVoltLabel('s', pst.sV);
+            ctx.restore();
+          }
+        }
+      }
       continue;
     }
     if ((col + 1) * CELL < x0 || col * CELL > x1 ||
@@ -870,6 +1090,7 @@ function redraw() {
     else if (typeof cell === 'object' && cell.pin !== undefined) drawPin(cell, st, un);
     else if (typeof cell === 'object') drawWires(cell, st, un);
     else drawTransistor(cell, st, un);
+    if (physical && st) drawVoltLabels(key, st);
     ctx.restore();
   }
 }
@@ -1418,6 +1639,16 @@ function testRun() {
 document.getElementById('testBtn').addEventListener('click', e => {
   e.target.blur();
   toggleTestPanel();
+});
+const physBox = document.getElementById('physBox');
+try { physBox.checked = physical = localStorage.getItem('fet-phys') === '1'; }
+catch (err) { /* storage unavailable */ }
+physBox.addEventListener('change', () => {
+  physical = physBox.checked;
+  physBox.blur();
+  try { localStorage.setItem('fet-phys', physical ? '1' : '0'); }
+  catch (err) { /* storage unavailable */ }
+  sync();
 });
 document.getElementById('runBtn').addEventListener('click', e => {
   e.target.blur();
