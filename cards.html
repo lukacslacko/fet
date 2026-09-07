@@ -101,8 +101,8 @@
     (<code>.kicad_pcb</code>) that EasyEDA opens with File &rsaquo; Import
     &rsaquo; KiCad, and KiCad opens directly. Every part is placed and
     every net assigned, but nothing is routed: route it there (or run
-    the autorouter), then order. 2N7002 transistors, 10k resistors, a
-    10k plus chip LED per LED pullup, 6&times;6&thinsp;mm tactile buttons; the
+    the autorouter), then order. 2N7002 transistors, 10k pullups, a 1k
+    plus chip LED per LED pullup, 6&times;6&thinsp;mm tactile buttons; the
     card's pins, after GND and VDD, on a single-row 2.54&thinsp;mm header.</div>
   <div class="pcbOpt">Cards used inside this one:
     <label><input type="radio" name="pcbSub" value="inline" checked>
@@ -140,7 +140,7 @@ const ctx = canvas.getContext('2d');
 // grid, and the name of the card being edited. A card's cells map
 // 'row,col' (integers, may be negative) to:
 //   - 'pullup', 'ground', 'left', 'right', 'cross', 'btn-open',
-//     'btn-closed', 'led' (an LED pullup: supply, 10k and an LED down
+//     'btn-closed', 'led' (an LED pullup: supply, 1k and an LED down
 //     to the bottom edge, lit when that node is pulled low)
 //   - a wire object {n, w, e, s} of booleans (at least one true) with
 //     an optional string 'name'; wires sharing a name are one net
@@ -493,15 +493,15 @@ function settleStep(circuit) {
 // K = 0.05 A/V^2, which matches Id(on) >= 75mA at Vgs = 4.5V and an
 // on-resistance of a few ohms (1/(2K(4.6-2)) ~ 3.8 ohm); channel-
 // length modulation is ignored. Pullups are 10k to a 4.6V rail. An
-// LED pullup is 10k plus an exponential red-LED diode (1.8V at 1mA,
-// about 1V at nanoamps) from the rail: it passes 0.29mA into a node
+// LED pullup is 1k plus an exponential red-LED diode (1.8V at 1mA,
+// about 1V at nanoamps) from the rail: it passes 2.7mA into a node
 // pulled low, and an undriven node under it floats up to ~3.6V.
 const PHYS = {
   VDD: 4.6,     // supply rail [V]
   VTH: 2.0,     // gate threshold [V]
   VBD: 0.6,     // body diode drop, source above drain [V]
   RPU: 10e3,    // pullup resistor [ohm]
-  RLED: 10e3,   // LED pullup series resistor [ohm]
+  RLED: 1e3,    // LED pullup series resistor [ohm]
   LED_IS: 1.7e-13,  // LED diode saturation current [A]
   LED_NVT: 0.08,    // LED diode n*Vt [V]
   K: 0.05,      // square-law channel constant [A/V^2]
@@ -1365,7 +1365,7 @@ function validateState(parsed) {
 // wires; inside inlined cards the name gets a /CARD1/NAME path.
 //
 // Parts: transistors are 2N7002 in SOT-23 (gate, source, drain on pins
-// 1, 2, 3), pullups 10k chip resistors, LED pullups a 10k from VDD
+// 1, 2, 3), pullups 10k chip resistors, LED pullups a 1k from VDD
 // and a chip LED, buttons 6x6 mm tactile switches. The card's
 // pins come out on a single-row 2.54 mm header J1 - GND, VDD, then the
 // pins in their canonical order. Cards used inside are either inlined
@@ -1501,7 +1501,7 @@ function pcbBuild(opts) {
         const off = chipSpan + 0.5;
         item = {w: pkg.across + 2.6, h: 4 * chipSpan + 2.2, make: (x, y) => {
           const mid = 'local:' + (++localCount);
-          parts.push(at(chip(nextRef('R'), '10k', 'R_' + pkgName,
+          parts.push(at(chip(nextRef('R'), '1k', 'R_' + pkgName,
                              {num: 1, net: 'VDD'}, {num: 2, net: mid}), x, y - off));
           parts.push(at(chip(nextRef('D'), 'LED', 'LED_' + pkgName,
                              {num: 2, net: mid}, {num: 1, net: port('s')}, true),

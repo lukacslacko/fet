@@ -35,11 +35,11 @@ states persist between rows, so latches can be clocked and then read —
 and the run stops on the failing row.
 
 An LED (`o`, cards editor only) is a pullup with an LED in series:
-supply, 10k, then the LED down to the square below. It lights when
+supply, 1k, then the LED down to the square below. It lights when
 that node is pulled low — put it on top of a transistor whose source
 goes to ground, and it shines while the gate is high. It counts as a
 pullup for the logic; in the physical sim its diode is exponential, so
-it passes about 0.3 mA into a low node and lets an undriven node under
+it passes about 2.7 mA into a low node and lets an undriven node under
 it float up to about 3.6 V.
 
 ### PCB export
@@ -49,7 +49,7 @@ file (`.kicad_pcb`) — EasyEDA imports it with File › Import › KiCad,
 KiCad opens it directly. Every part is placed in a grid mirroring the
 card (empty rows and columns collapsed) with every net assigned, but
 nothing is routed: route or autoroute there, then order. Parts are
-2N7002 transistors in SOT-23, 10k chip resistors, a 10k from VDD plus
+2N7002 transistors in SOT-23, 10k chip resistors, a 1k from VDD plus
 a chip LED per LED pullup (0603 or 0805, selectable), and 6×6 mm tactile
 switches for buttons. The card's pins come out on a single-row
 2.54 mm header J1: GND, VDD, then the pins in their canonical order.
