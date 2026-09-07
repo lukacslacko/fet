@@ -34,6 +34,30 @@ net high/low). Run/Step/Restart execute the rows in order — node
 states persist between rows, so latches can be clocked and then read —
 and the run stops on the failing row.
 
+An LED (`o`, cards editor only) is a pullup with an LED in series:
+supply, 10k, then the LED down to the square below. It lights when
+that node is pulled low — put it on top of a transistor whose source
+goes to ground, and it shines while the gate is high. It counts as a
+pullup for the logic; in the physical sim its diode is exponential, so
+it passes about 0.3 mA into a low node and lets an undriven node under
+it float up to about 3.6 V.
+
+### PCB export
+
+The **PCB…** button downloads the current card as a KiCad 5 board
+file (`.kicad_pcb`) — EasyEDA imports it with File › Import › KiCad,
+KiCad opens it directly. Every part is placed in a grid mirroring the
+card (empty rows and columns collapsed) with every net assigned, but
+nothing is routed: route or autoroute there, then order. Parts are
+2N7002 transistors in SOT-23, 10k chip resistors, a 10k from VDD plus
+a chip LED per LED pullup (0603 or 0805, selectable), and 6×6 mm tactile
+switches for buttons. The card's pins come out on a single-row
+2.54 mm header J1: GND, VDD, then the pins in their canonical order.
+Cards used inside the card are either inlined (their parts boxed and
+labelled on the silkscreen, their nets named `CARD1/NET`) or each
+becomes a matching single-row socket — GND, VDD, that card's pins —
+that the card's own board plugs onto.
+
 ## Keys
 
 Point at a square and press:
@@ -41,6 +65,7 @@ Point at a square and press:
 - `p` pullup, `g` ground, `l`/`r` left/right facing transistor
 - `w`/`a`/`s`/`d` toggle a wire arm to the top/left/bottom/right edge
 - `x` crossing (wires cross without connecting), `b` button
+- `o` LED (cards editor)
 - `enter` flip the button under the mouse, `space` clear the square
 - `n` name the hovered wire's net; nets with equal names are connected
 - `j` JSON dialog to export/import the circuit

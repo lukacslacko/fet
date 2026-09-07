@@ -16,6 +16,13 @@
   #jsonText { width: 480px; height: 320px; font-family: monospace; font-size: 12px; }
   #jsonRow, #cardRow { margin-top: 8px; display: flex; gap: 12px; align-items: center; }
   #jsonNote, #cardNote { color: #555; }
+  #pcbDialog { max-width: 540px; }
+  .pcbOpt { margin-top: 10px; }
+  .pcbOpt label { display: block; margin: 3px 0 0 14px; }
+  #pcbBom { margin-top: 10px; color: #555; }
+  #pcbBom ul { margin: 4px 0 0; padding-left: 20px; }
+  #pcbRow { margin-top: 10px; display: flex; gap: 12px; align-items: center; }
+  #pcbNote { color: #555; }
   #mainRow { display: flex; gap: 8px; align-items: flex-start; }
   #testPanel { flex: none; max-width: min(45vw, 560px);
                max-height: calc(100vh - 220px); overflow: auto;
@@ -45,6 +52,7 @@
   <button id="newCardBtn">New card</button>
   <button id="delCardBtn">Delete card</button>
   <button id="testBtn">Tests</button>
+  <button id="pcbBtn">PCB&hellip;</button>
   <label><input type="checkbox" id="physBox"> physical</label>
 </div>
 <div id="mainRow">
@@ -67,7 +75,7 @@
   <kbd>p</kbd> pullup &nbsp; <kbd>g</kbd> ground &nbsp;
   <kbd>l</kbd>/<kbd>r</kbd> left/right transistor &nbsp;
   <kbd>w</kbd>/<kbd>a</kbd>/<kbd>s</kbd>/<kbd>d</kbd> toggle wire arm &nbsp;
-  <kbd>x</kbd> crossing &nbsp; <kbd>b</kbd> button &nbsp;
+  <kbd>x</kbd> crossing &nbsp; <kbd>b</kbd> button &nbsp; <kbd>o</kbd> LED &nbsp;
   <kbd>e</kbd> pin &nbsp; <kbd>c</kbd> add card &nbsp;
   <kbd>n</kbd> name net &nbsp;
   <kbd>enter</kbd> flip button / cycle pin &nbsp; <kbd>space</kbd> clear &nbsp;
@@ -88,6 +96,33 @@
     <span id="cardNote"></span>
   </div>
 </dialog>
+<dialog id="pcbDialog">
+  <div><b>Download as a PCB</b> &mdash; a KiCad board file
+    (<code>.kicad_pcb</code>) that EasyEDA opens with File &rsaquo; Import
+    &rsaquo; KiCad, and KiCad opens directly. Every part is placed and
+    every net assigned, but nothing is routed: route it there (or run
+    the autorouter), then order. 2N7002 transistors, 10k resistors, a
+    10k plus chip LED per LED pullup, 6&times;6&thinsp;mm tactile buttons; the
+    card's pins, after GND and VDD, on a single-row 2.54&thinsp;mm header.</div>
+  <div class="pcbOpt">Cards used inside this one:
+    <label><input type="radio" name="pcbSub" value="inline" checked>
+      inline their circuits</label>
+    <label><input type="radio" name="pcbSub" value="header">
+      a single-row socket each (GND, VDD, that card's pins), so the
+      card's own board can plug onto it</label>
+  </div>
+  <div class="pcbOpt">Resistor and LED size:
+    <select id="pcbPkg">
+      <option value="0603">0603</option>
+      <option value="0805">0805</option>
+    </select>
+  </div>
+  <div id="pcbBom"></div>
+  <div id="pcbRow">
+    <button id="pcbDownloadBtn">Download</button>
+    <span id="pcbNote"></span>
+  </div>
+</dialog>
 <dialog id="jsonDialog">
   <textarea id="jsonText" spellcheck="false"></textarea>
   <div id="jsonRow">
@@ -105,7 +140,8 @@ const ctx = canvas.getContext('2d');
 // grid, and the name of the card being edited. A card's cells map
 // 'row,col' (integers, may be negative) to:
 //   - 'pullup', 'ground', 'left', 'right', 'cross', 'btn-open',
-//     'btn-closed'
+//     'btn-closed', 'led' (an LED pullup: supply, 10k and an LED down
+//     to the bottom edge, lit when that node is pulled low)
 //   - a wire object {n, w, e, s} of booleans (at least one true) with
 //     an optional string 'name'; wires sharing a name are one net
 //   - a pin object {pin: NAME, drive: 'float'|'high'|'low'} - an
@@ -190,7 +226,7 @@ function cellPortsOf(cell) {
     if (cell.pin !== undefined) return ['n', 's'];
     return 'nwes'.split('').filter(d => cell[d]);
   }
-  return {'pullup': ['s'], 'ground': ['n'],
+  return {'pullup': ['s'], 'ground': ['n'], 'led': ['s'],
           'left': ['n', 's', 'w'], 'right': ['n', 's', 'e'],
           'cross': ['n', 's', 'w', 'e'],
           'btn-open': ['n', 's'], 'btn-closed': ['n', 's']}[cell];
@@ -236,7 +272,12 @@ function cardClosure(cardName, out = new Set()) {
 // sub-card's cells are added under a unique prefix, and each of its
 // pins is unioned with the instance's bottom-edge port in the parent.
 // Port keys are 'r,c,d' with a 'r,c#' prefix per instance level.
-function buildCircuit() {
+// Every element records its full (prefixed) cell key, and with
+// {flatten: false} instances are not recursed into but kept as opaque
+// connectors (circuit.instances), which is what the PCB export uses
+// to turn them into sockets.
+function buildCircuit(opts = {}) {
+  const flatten = opts.flatten !== false;
   const parent = new Map();
   const find = p => {
     while (parent.get(p) !== p) {
@@ -306,29 +347,47 @@ function buildCircuit() {
     for (const [key, cell] of entries) {
       const [r, c] = key.split(',').map(Number);
       const pk = d => prefix + key + ',' + d;
+      const full = prefix + key;
       if (cell === 'pullup') {
-        specs.push({kind: 'pullup', p: pk('s')});
+        specs.push({kind: 'pullup', p: pk('s'), key: full});
       } else if (cell === 'ground') {
-        specs.push({kind: 'ground', p: pk('n')});
+        specs.push({kind: 'ground', p: pk('n'), key: full});
+      } else if (cell === 'led') {
+        specs.push({kind: 'led', p: pk('s'), key: full});
       } else if (cell === 'left' || cell === 'right') {
         specs.push({kind: 'fet', source: pk('s'), drain: pk('n'),
-                    gate: pk(cell === 'left' ? 'w' : 'e')});
+                    gate: pk(cell === 'left' ? 'w' : 'e'), key: full});
       } else if (cell === 'btn-open' || cell === 'btn-closed') {
         specs.push({kind: 'button', up: pk('n'), down: pk('s'),
-                    pressed: cell === 'btn-closed',
+                    pressed: cell === 'btn-closed', key: full,
                     topKey: prefix === '' ? key : null});
       } else if (cell && cell.pin !== undefined) {
         // A pin's user-set drive only acts on the card being edited;
         // inside an instance it is just a connector.
-        specs.push({kind: 'pin', p: pk('n'),
+        specs.push({kind: 'pin', p: pk('n'), name: cell.pin, key: full,
                     drive: prefix === '' ? (cell.drive || 'float') : 'float',
                     topKey: prefix === '' ? key : null});
       } else if (cell && cell.card) {
         if (stack.includes(cell.card) || !state.cards[cell.card]) continue;
+        const pins = collectPins(cell.card);
+        if (!flatten) {
+          // Opaque instance: its bottom-edge ports are its terminals,
+          // one per distinct pin name (the sub-card joins same-named
+          // pins, so join their columns here too).
+          const byName = new Map();
+          pins.forEach((pin, i) => {
+            const p = prefix + (r + 1) + ',' + (c + i) + ',s';
+            if (byName.has(pin.name)) union(byName.get(pin.name), p);
+            else byName.set(pin.name, p);
+          });
+          specs.push({kind: 'instance', card: cell.card, key: full,
+                      terminals: [...byName].map(([name, p]) => ({name, p}))});
+          continue;
+        }
         const subPrefix = prefix + key + '#';
         addCard(subPrefix, Object.entries(state.cards[cell.card].cells),
                 [...stack, cell.card]);
-        collectPins(cell.card).forEach((pin, i) => {
+        pins.forEach((pin, i) => {
           union(prefix + (r + 1) + ',' + (c + i) + ',s',
                 subPrefix + pin.r + ',' + pin.c + ',n');
         });
@@ -346,27 +405,35 @@ function buildCircuit() {
     portNodes.set(p, rootNodes.get(root));
   }
 
-  const circuit = {transistors: [], pullups: [], grounds: [], buttons: [], pins: []};
+  const circuit = {transistors: [], pullups: [], grounds: [], leds: [],
+                   buttons: [], pins: [], instances: []};
   const buttonsByCell = new Map();
   const pinsByCell = new Map();
   for (const s of specs) {
     if (s.kind === 'pullup') {
-      circuit.pullups.push({node: portNodes.get(s.p)});
+      circuit.pullups.push({node: portNodes.get(s.p), key: s.key});
     } else if (s.kind === 'ground') {
-      circuit.grounds.push({node: portNodes.get(s.p)});
+      circuit.grounds.push({node: portNodes.get(s.p), key: s.key});
+    } else if (s.kind === 'led') {
+      circuit.leds.push({node: portNodes.get(s.p), key: s.key});
     } else if (s.kind === 'fet') {
       circuit.transistors.push({source: portNodes.get(s.source),
                                 gate: portNodes.get(s.gate),
-                                drain: portNodes.get(s.drain)});
+                                drain: portNodes.get(s.drain), key: s.key});
     } else if (s.kind === 'button') {
       const button = {up: portNodes.get(s.up), down: portNodes.get(s.down),
-                      pressed: s.pressed};
+                      pressed: s.pressed, key: s.key};
       circuit.buttons.push(button);
       if (s.topKey) buttonsByCell.set(s.topKey, button);
     } else if (s.kind === 'pin') {
-      const pin = {node: portNodes.get(s.p), drive: s.drive};
+      const pin = {node: portNodes.get(s.p), drive: s.drive, name: s.name,
+                   key: s.key};
       circuit.pins.push(pin);
       if (s.topKey) pinsByCell.set(s.topKey, pin);
+    } else if (s.kind === 'instance') {
+      circuit.instances.push({card: s.card, key: s.key,
+                              terminals: s.terminals.map(t =>
+                                  ({name: t.name, node: portNodes.get(t.p)}))});
     }
   }
   return {circuit, portNodes, buttonsByCell, pinsByCell};
@@ -375,8 +442,8 @@ function buildCircuit() {
 // One synchronous update step; true when nothing changed. Conduction is
 // sampled from the entry states, then every node is recomputed: nodes
 // joined by conducting channels form a group, LOW if it touches a
-// ground (or a pin driven low), else HIGH if it touches a pullup (or a
-// pin driven high), else FLOAT.
+// ground (or a pin driven low), else HIGH if it touches a pullup (an
+// LED pullup counts, or a pin driven high), else FLOAT.
 function settleStep(circuit) {
   const nodes = new Set();
   for (const t of circuit.transistors) {
@@ -384,6 +451,7 @@ function settleStep(circuit) {
   }
   for (const p of circuit.pullups) nodes.add(p.node);
   for (const g of circuit.grounds) nodes.add(g.node);
+  for (const l of circuit.leds) nodes.add(l.node);
   for (const b of circuit.buttons) { nodes.add(b.up); nodes.add(b.down); }
   for (const p of circuit.pins) nodes.add(p.node);
 
@@ -403,6 +471,7 @@ function settleStep(circuit) {
 
   const grounded = new Set(circuit.grounds.map(g => find(g.node)));
   const pulledUp = new Set(circuit.pullups.map(p => find(p.node)));
+  for (const l of circuit.leds) pulledUp.add(find(l.node));
   for (const p of circuit.pins) {
     if (p.drive === 'low') grounded.add(find(p.node));
     else if (p.drive === 'high') pulledUp.add(find(p.node));
@@ -423,12 +492,18 @@ function settleStep(circuit) {
 // 0.6V body diode from source to drain, and a square-law channel with
 // K = 0.05 A/V^2, which matches Id(on) >= 75mA at Vgs = 4.5V and an
 // on-resistance of a few ohms (1/(2K(4.6-2)) ~ 3.8 ohm); channel-
-// length modulation is ignored. Pullups are 10k to a 4.6V rail.
+// length modulation is ignored. Pullups are 10k to a 4.6V rail. An
+// LED pullup is 10k plus an exponential red-LED diode (1.8V at 1mA,
+// about 1V at nanoamps) from the rail: it passes 0.29mA into a node
+// pulled low, and an undriven node under it floats up to ~3.6V.
 const PHYS = {
   VDD: 4.6,     // supply rail [V]
   VTH: 2.0,     // gate threshold [V]
   VBD: 0.6,     // body diode drop, source above drain [V]
   RPU: 10e3,    // pullup resistor [ohm]
+  RLED: 10e3,   // LED pullup series resistor [ohm]
+  LED_IS: 1.7e-13,  // LED diode saturation current [A]
+  LED_NVT: 0.08,    // LED diode n*Vt [V]
   K: 0.05,      // square-law channel constant [A/V^2]
   RDIO: 0.6,    // body diode slope resistance [ohm]
   GLEAK: 1e-8,  // leak to ground on every node (100 Mohm)
@@ -467,6 +542,26 @@ function fetCurrent(vg, vs, vd) {
   return {i, g};
 }
 
+// Current from the rail through an LED pullup (RLED in series with
+// the diode) into its node, with vtot = VDD - Vnode across the pair,
+// and the pair's conductance. Newton on the diode drop, started from
+// above: the exponential is convex, so it walks down without
+// overshooting.
+function ledCurrent(vtot) {
+  let vd = Math.min(vtot, 1.9), e = 0;
+  for (let k = 0; k < 30; k++) {
+    e = Math.exp(Math.min(vd / PHYS.LED_NVT, 60));
+    const step = (PHYS.LED_IS * (e - 1) - (vtot - vd) / PHYS.RLED) /
+                 (PHYS.LED_IS * e / PHYS.LED_NVT + 1 / PHYS.RLED);
+    vd -= step;
+    if (Math.abs(step) < 1e-9) break;
+  }
+  e = Math.exp(Math.min(vd / PHYS.LED_NVT, 60));
+  return {i: PHYS.LED_IS * (e - 1),
+          g: 1 / (PHYS.RLED + PHYS.LED_NVT / (PHYS.LED_IS * e))};
+}
+const LED_FULL = ledCurrent(PHYS.VDD).i;   // current with the node at 0V
+
 // Find the DC equilibrium of the circuit by damped per-node
 // relaxation with adaptive step sizes (a node whose step flips sign
 // halves it), starting from the previous solution so bistable
@@ -480,6 +575,7 @@ function solvePhysical(circuit) {
   }
   for (const p of circuit.pullups) nodes.add(p.node);
   for (const g of circuit.grounds) nodes.add(g.node);
+  for (const l of circuit.leds) nodes.add(l.node);
   for (const b of circuit.buttons) { nodes.add(b.up); nodes.add(b.down); }
   for (const p of circuit.pins) nodes.add(p.node);
 
@@ -527,6 +623,12 @@ function solvePhysical(circuit) {
       const r = find(p.node);
       I.set(r, I.get(r) + (PHYS.VDD - V.get(r)) / PHYS.RPU);
       G.set(r, G.get(r) + 1 / PHYS.RPU);
+    }
+    for (const l of circuit.leds) {
+      const r = find(l.node);
+      const {i, g} = ledCurrent(PHYS.VDD - V.get(r));
+      I.set(r, I.get(r) + i);
+      G.set(r, G.get(r) + g);
     }
     for (const t of circuit.transistors) {
       const rs = find(t.source), rd = find(t.drain);
@@ -870,6 +972,66 @@ function drawGround() {
   ctx.stroke();
 }
 
+function drawLed(st, un) {
+  // An LED pullup: supply circle, resistor, then the LED down to the
+  // bottom edge, so it lights when the node below is pulled low (by a
+  // transistor under it, say). The supply side is always red and the
+  // resistor ink; the diode fills red and glows with its current (all
+  // or nothing in the logic sim); the lead below follows the node.
+  const v = physical ? wireVolt(st, 's') : null;
+  const bright = v !== null
+      ? Math.max(0, Math.min(1, ledCurrent(PHYS.VDD - v).i / LED_FULL))
+      : wireState(st, 's') === 'LOW' ? 1 : 0;
+  ctx.strokeStyle = WIRE_COLORS.HIGH;
+  ctx.beginPath();
+  ctx.arc(cx, 8, 5, 0, 2 * Math.PI);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx, 13);
+  ctx.lineTo(cx, 18);
+  ctx.stroke();
+  setInkStyle();
+  ctx.strokeRect(cx - 6, 18, 12, 14);
+  ctx.beginPath();
+  ctx.moveTo(cx, 32);
+  ctx.lineTo(cx, 37);
+  ctx.stroke();
+  if (bright > 0) {
+    ctx.fillStyle = 'rgba(255, 70, 40, ' + (0.35 * bright).toFixed(2) + ')';
+    ctx.beginPath();
+    ctx.arc(cx, 44, 11 + 4 * bright, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  ctx.beginPath();
+  ctx.moveTo(cx - 8, 37);
+  ctx.lineTo(cx + 8, 37);
+  ctx.lineTo(cx, 51);
+  ctx.closePath();
+  const dim = Math.round(200 - 170 * bright);
+  ctx.fillStyle = bright > 0 ? 'rgb(255, ' + dim + ', ' + dim + ')' : '#fff';
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(cx - 8, 51);
+  ctx.lineTo(cx + 8, 51);
+  ctx.stroke();
+  // Emitted light: two little arrows off to the upper right.
+  for (const [x, y] of [[cx + 7, 40], [cx + 10, 44]]) {
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + 6, y - 6);
+    ctx.moveTo(x + 2.5, y - 6);
+    ctx.lineTo(x + 6, y - 6);
+    ctx.lineTo(x + 6, y - 2.5);
+    ctx.stroke();
+  }
+  setWireStyle(st, 's');
+  strokeWithHalo(un, 's', () => {
+    ctx.moveTo(cx, 51);
+    ctx.lineTo(cx, CELL);
+  });
+}
+
 function drawTransistor(dir, st, un) {
   // Drain wire down from the top middle to a third of the cell, bending
   // sideways toward the gate; same from the bottom for the source. A
@@ -1084,6 +1246,7 @@ function redraw() {
     setInkStyle();
     if (cell === 'pullup') drawPullup(st, un);
     else if (cell === 'ground') drawGround();
+    else if (cell === 'led') drawLed(st, un);
     else if (cell === 'cross') drawCross(st, un);
     else if (cell === 'btn-open') drawButton(false, st, un);
     else if (cell === 'btn-closed') drawButton(true, st, un);
@@ -1115,10 +1278,10 @@ canvas.addEventListener('mousemove', e => {
 canvas.addEventListener('mouseleave', () => { lastMouse = null; updateHover(); });
 
 const KEYS = {p: 'pullup', g: 'ground', l: 'left', r: 'right', x: 'cross',
-              b: 'btn-open', ' ': null};
+              b: 'btn-open', o: 'led', ' ': null};
 const ARM_KEYS = {w: 'n', a: 'w', s: 's', d: 'e'};
 const CELL_VALUES = new Set(['pullup', 'ground', 'left', 'right', 'cross',
-                             'btn-open', 'btn-closed']);
+                             'btn-open', 'btn-closed', 'led']);
 // Migration of the old one-char test values: h/l drove the pin high/
 // low, 1/0 expected the net high/low.
 const TEST_LEGACY = {h: 'a1', l: 'a0', '1': 'o1', '0': 'o0'};
@@ -1192,6 +1355,496 @@ function validateState(parsed) {
                  parsed.current in out.cards) ? parsed.current : cardNames[0];
   return out;
 }
+
+// ===== PCB export =====
+// The current card as a KiCad 5 board file (.kicad_pcb), which EasyEDA
+// opens with File > Import > KiCad and KiCad opens directly. Parts are
+// placed in a grid mirroring the card (empty rows and columns
+// collapsed) with every net assigned but no traces: route there, or
+// run the autorouter, then order. Nets are named after pins and named
+// wires; inside inlined cards the name gets a /CARD1/NAME path.
+//
+// Parts: transistors are 2N7002 in SOT-23 (gate, source, drain on pins
+// 1, 2, 3), pullups 10k chip resistors, LED pullups a 10k from VDD
+// and a chip LED, buttons 6x6 mm tactile switches. The card's
+// pins come out on a single-row 2.54 mm header J1 - GND, VDD, then the
+// pins in their canonical order. Cards used inside are either inlined
+// or each becomes a matching single-row socket (GND, VDD, that card's
+// pins) that the card's own board plugs onto.
+
+const PCB_PKG = {   // chip pads [mm]: pitch, and pad size along/across
+  '0603': {pitch: 1.6, along: 0.9, across: 1.0},
+  '0805': {pitch: 1.9, along: 1.0, across: 1.4},
+};
+const HDR_PITCH = 2.54;
+
+// Builds the board: {text, name, bom, subCards} with the file text, a
+// file name, the parts list as [description, count] pairs and, in
+// socket mode, the cards to export separately.
+function pcbBuild(opts) {
+  const inline = !!opts.inline;
+  const pkgName = opts.pkg in PCB_PKG ? opts.pkg : '0603';
+  const pkg = PCB_PKG[pkgName];
+  persistCurrent();
+  const {circuit, portNodes} = buildCircuit({flatten: inline});
+  const gndNodes = new Set(circuit.grounds.map(g => g.node));
+
+  // Footprints are unrotated, in part-local mm with y down like the
+  // editor. Pads: {num, x, y, w, h, net, drill?, shape?}; net is
+  // 'GND', 'VDD', 'port:<port key>' or 'local:<id>', resolved at the
+  // end. lines and circles are silkscreen.
+  const parts = [];
+  const silk = [];    // board-level silkscreen lines [x1, y1, x2, y2]
+  const texts = [];   // board-level silkscreen texts
+  const names = [];   // net name candidates {node, name, prio}
+  const refCount = {};
+  const nextRef = prefix =>
+      prefix + (refCount[prefix] = (refCount[prefix] || 0) + 1);
+  let localCount = 0;
+  const chipSpan = pkg.pitch / 2 + pkg.along / 2;   // chip pads reach +-this
+  const at = (part, x, y) => Object.assign(part, {x, y});
+  const textLen = (text, size) => size * 0.9 * text.length + 0.2;
+
+  // A chip resistor or LED standing upright: pad `top` above `bottom`.
+  function chip(ref, value, fp, top, bottom, cathodeMark) {
+    const pads = [{num: top.num, x: 0, y: -pkg.pitch / 2,
+                   w: pkg.across, h: pkg.along, net: top.net},
+                  {num: bottom.num, x: 0, y: pkg.pitch / 2,
+                   w: pkg.across, h: pkg.along, net: bottom.net}];
+    const sx = pkg.across / 2 + 0.3;
+    const lines = cathodeMark ? [[-sx, chipSpan + 0.3, sx, chipSpan + 0.3]] : [];
+    return {ref, value, fp, smd: true, pads, lines,
+            refAt: [sx + 0.7, 0, 90], valAt: [-sx - 0.7, 0, 90]};
+  }
+
+  function sot23(ref, gate, source, drain) {
+    const pads = [{num: 1, x: -0.95, y: 1.0, w: 0.8, h: 1.0, net: gate},
+                  {num: 2, x: 0.95, y: 1.0, w: 0.8, h: 1.0, net: source},
+                  {num: 3, x: 0, y: -1.0, w: 0.8, h: 1.0, net: drain}];
+    // Body ends and top edge; the pin 1 side runs on down to mark it.
+    const lines = [[-1.6, -0.75, -1.6, 1.6], [1.6, -0.75, 1.6, 0.75],
+                   [-1.6, -0.75, -0.65, -0.75], [0.65, -0.75, 1.6, -0.75]];
+    return {ref, value: '2N7002', fp: 'SOT-23', smd: true, pads, lines,
+            refAt: [0, -2.2, 0], valAt: [0, 2.3, 0]};
+  }
+
+  function tactile(ref, up, down) {
+    const pad = (num, x, y, net) =>
+        ({num, x, y, w: 2.0, h: 2.0, drill: 1.1, shape: 'circle', net});
+    const pads = [pad(1, -3.25, -2.25, up), pad(1, 3.25, -2.25, up),
+                  pad(2, -3.25, 2.25, down), pad(2, 3.25, 2.25, down)];
+    const lines = [[-2, -3, 2, -3], [-2, 3, 2, 3], [-3, -1, -3, 1], [3, -1, 3, 1]];
+    return {ref, value: 'Tactile 6x6', fp: 'SW_PUSH_6mm', smd: false,
+            pads, lines, circles: [[0, 0, 1.75]],
+            refAt: [0, -4.4, 0], valAt: [0, 4.4, 0]};
+  }
+
+  // Single-row 2.54 mm header or socket, pin 1 on the left.
+  function header(ref, value, fp, pins) {
+    const n = pins.length;
+    const pads = pins.map((p, i) => ({num: i + 1, x: (i - (n - 1) / 2) * HDR_PITCH,
+                                      y: 0, w: 1.7, h: 1.7, drill: 1.0,
+                                      shape: i ? 'circle' : 'rect', net: p.net}));
+    const hw = n * HDR_PITCH / 2;
+    const lines = [[-hw, -1.27, hw, -1.27], [hw, -1.27, hw, 1.27],
+                   [hw, 1.27, -hw, 1.27], [-hw, 1.27, -hw, -1.27]];
+    return {ref, value, fp, smd: false, pads, lines,
+            refAt: [-hw - 1.0, 0, 90], valAt: [0, 0, 0]};
+  }
+
+  // Pin names under a header's pads, reading upward; labelSpace is
+  // the height they need.
+  function labelPins(pins, x, y) {
+    pins.forEach((p, i) => {
+      texts.push({text: p.name, x: x + (i - (pins.length - 1) / 2) * HDR_PITCH,
+                  y: y + 1.5 + textLen(p.name, 0.8) / 2, size: 0.8, rot: 90});
+    });
+  }
+  const labelSpace = pins =>
+      Math.max(...pins.map(p => textLen(p.name, 0.8))) + 2.2;
+
+  // Distinct pin names of a card in canonical order, each with the
+  // cell key and the collectPins index of its first pin.
+  function pinList(cardName) {
+    const out = [], seen = new Set();
+    collectPins(cardName).forEach((pin, i) => {
+      if (seen.has(pin.name)) return;
+      seen.add(pin.name);
+      out.push({name: pin.name, key: pin.r + ',' + pin.c, i});
+    });
+    return out;
+  }
+
+  // Lays out one card as a table: every part-bearing cell is an item
+  // at its (row, col) with a size; a column is as wide as its widest
+  // item and a row as tall as its tallest, empty ones vanish. Returns
+  // {items, w, h} with each item's center relative to the block's
+  // top-left corner; item.make(x, y) emits its parts at an absolute
+  // position. Pins and named wires only contribute net names.
+  function layoutCard(prefix, cardName, path, stack) {
+    const items = [];
+    const instCount = {};
+    const depth = stack.length - 1;
+    const named = name => path ? path + '/' + name : name;
+    for (const [key, cell] of Object.entries(state.cards[cardName].cells)) {
+      const [r, c] = key.split(',').map(Number);
+      const full = prefix + key;
+      const port = d => 'port:' + full + ',' + d;
+      let item = null;
+      if (cell === 'pullup') {
+        item = {w: pkg.across + 2.6, h: 2 * chipSpan + 1.2, make: (x, y) => {
+          parts.push(at(chip(nextRef('R'), '10k', 'R_' + pkgName,
+                             {num: 1, net: 'VDD'}, {num: 2, net: port('s')}), x, y));
+        }};
+      } else if (cell === 'led') {
+        // The resistor from VDD on top, the LED under it down to the node.
+        const off = chipSpan + 0.5;
+        item = {w: pkg.across + 2.6, h: 4 * chipSpan + 2.2, make: (x, y) => {
+          const mid = 'local:' + (++localCount);
+          parts.push(at(chip(nextRef('R'), '10k', 'R_' + pkgName,
+                             {num: 1, net: 'VDD'}, {num: 2, net: mid}), x, y - off));
+          parts.push(at(chip(nextRef('D'), 'LED', 'LED_' + pkgName,
+                             {num: 2, net: mid}, {num: 1, net: port('s')}, true),
+                        x, y + off));
+        }};
+      } else if (cell === 'left' || cell === 'right') {
+        item = {w: 4.2, h: 5.4, make: (x, y) => {
+          parts.push(at(sot23(nextRef('Q'), port(cell === 'left' ? 'w' : 'e'),
+                              port('s'), port('n')), x, y));
+        }};
+      } else if (cell === 'btn-open' || cell === 'btn-closed') {
+        item = {w: 9.5, h: 10, make: (x, y) => {
+          parts.push(at(tactile(nextRef('SW'), port('n'), port('s')), x, y));
+        }};
+      } else if (cell && typeof cell === 'object') {
+        if (cell.pin !== undefined) {
+          names.push({node: portNodes.get(full + ',n'), name: named(cell.pin),
+                      prio: 2 * depth});
+        } else if (cell.card) {
+          if (!state.cards[cell.card] || stack.includes(cell.card)) continue;
+          const label = cell.card +
+              (instCount[cell.card] = (instCount[cell.card] || 0) + 1);
+          if (inline) {
+            const sub = layoutCard(prefix + key + '#', cell.card, named(label),
+                                   [...stack, cell.card]);
+            // The sub-block, boxed and labeled on the silkscreen.
+            item = {w: sub.w + 3, h: sub.h + 4, make: (x, y) => {
+              const x0 = x - sub.w / 2, y0 = y - sub.h / 2 + 0.5;
+              emitBlock(sub, x0, y0);
+              const l = x0 - 1, t = y0 - 1.6, rr = x0 + sub.w + 1, b = y0 + sub.h + 1;
+              silk.push([l, t, rr, t], [rr, t, rr, b], [rr, b, l, b], [l, b, l, t]);
+              texts.push({text: label, x: l + 0.3, y: t - 0.7, size: 0.8, rot: 0,
+                          left: true});
+            }};
+          } else {
+            const pins = [{name: 'GND', net: 'GND'}, {name: 'VDD', net: 'VDD'}];
+            for (const p of pinList(cell.card)) {
+              pins.push({name: p.name,
+                         net: 'port:' + prefix + (r + 1) + ',' + (c + p.i) + ',s'});
+            }
+            const h = 4.5 + labelSpace(pins);
+            item = {w: pins.length * HDR_PITCH + 2.5, h, make: (x, y) => {
+              const hy = y - h / 2 + 2.6;
+              parts.push(at(header(nextRef('J'), cell.card + ' socket',
+                                   'PinSocket_1x' + pins.length + '_P2.54mm', pins),
+                            x, hy));
+              labelPins(pins, x, hy);
+              texts.push({text: cell.card, x, y: hy - 2.0, size: 0.8, rot: 0});
+            }};
+          }
+        } else if (cell.name) {
+          names.push({node: portNodes.get(full + ',' + cellPortsOf(cell)[0]),
+                      name: named(cell.name), prio: 2 * depth + 1});
+        }
+      }
+      if (item) {
+        item.r = r;
+        item.c = c;
+        items.push(item);
+      }
+    }
+    const colW = new Map(), rowH = new Map();
+    for (const it of items) {
+      colW.set(it.c, Math.max(colW.get(it.c) || 0, it.w));
+      rowH.set(it.r, Math.max(rowH.get(it.r) || 0, it.h));
+    }
+    const colX = new Map(), rowY = new Map();
+    let w = 0, h = 0;
+    for (const c of [...colW.keys()].sort((a, b) => a - b)) {
+      colX.set(c, w + colW.get(c) / 2);
+      w += colW.get(c);
+    }
+    for (const r of [...rowH.keys()].sort((a, b) => a - b)) {
+      rowY.set(r, h + rowH.get(r) / 2);
+      h += rowH.get(r);
+    }
+    for (const it of items) {
+      it.x = colX.get(it.c);
+      it.y = rowY.get(it.r);
+    }
+    return {items, w, h};
+  }
+
+  function emitBlock(block, x0, y0) {
+    for (const it of block.items) it.make(x0 + it.x, y0 + it.y);
+  }
+
+  // The board: the interface header along the top edge with its pin
+  // labels, the parts grid below, the card name at the bottom.
+  const top = layoutCard('', state.current, '', [state.current]);
+  const hdrPins = [{name: 'GND', net: 'GND'}, {name: 'VDD', net: 'VDD'}];
+  for (const p of pinList(state.current)) {
+    hdrPins.push({name: p.name, net: 'port:' + p.key + ',n'});
+  }
+  const M = 2.0;                              // board margin
+  const hdrW = hdrPins.length * HDR_PITCH;
+  const W = Math.max(top.w, hdrW + 3) + 2 * M;
+  const hdrY = M + 1.3;
+  const y0 = hdrY + 1.5 + labelSpace(hdrPins);
+  const H = y0 + top.h + M + 2.2;
+  const ox = 20, oy = 20;                     // board corner on the sheet
+  const hdrX = ox + M + 1.5 + hdrW / 2;
+  const hdrRef = nextRef('J');                // J1, before any socket
+  parts.push(at(header(hdrRef, state.current + ' pins',
+                       'PinHeader_1x' + hdrPins.length + '_P2.54mm', hdrPins),
+                hdrX, oy + hdrY));
+  labelPins(hdrPins, hdrX, oy + hdrY);
+  emitBlock(top, ox + (W - top.w) / 2, oy + y0);
+  texts.push({text: state.current, x: ox + M, y: oy + H - 1.6, size: 1.0,
+              rot: 0, left: true});
+  const edges = [[ox, oy, ox + W, oy], [ox + W, oy, ox + W, oy + H],
+                 [ox + W, oy + H, ox, oy + H], [ox, oy + H, ox, oy]];
+
+  // Net names: the card's own pins first, then its named wires, then
+  // the same inside inlined cards, outermost first; every ground is
+  // GND, everything still unnamed becomes N1, N2, ...
+  names.sort((a, b) => a.prio - b.prio);
+  const nodeName = new Map();
+  const used = new Set(['GND', 'VDD']);
+  const claim = base => {
+    let name = base, k = 2;
+    while (used.has(name)) name = base + '_' + k++;
+    used.add(name);
+    return name;
+  };
+  for (const cand of names) {
+    if (!cand.node || nodeName.has(cand.node) || gndNodes.has(cand.node)) continue;
+    nodeName.set(cand.node, claim(cand.name.replace(/[^A-Za-z0-9_\/.-]/g, '_')));
+  }
+  let anon = 0;
+  const anonName = () => {
+    let name;
+    do { name = 'N' + (++anon); } while (used.has(name));
+    used.add(name);
+    return name;
+  };
+  const netNames = ['', 'GND', 'VDD'];
+  const netNums = new Map([['GND', 1], ['VDD', 2]]);
+  const localNames = new Map();
+  function resolve(ref) {
+    let name;
+    if (ref === 'GND' || ref === 'VDD') {
+      name = ref;
+    } else if (ref.startsWith('local:')) {
+      if (!localNames.has(ref)) localNames.set(ref, anonName());
+      name = localNames.get(ref);
+    } else {
+      const node = portNodes.get(ref.slice(5));
+      if (!node) return 0;
+      if (gndNodes.has(node)) name = 'GND';
+      else {
+        if (!nodeName.has(node)) nodeName.set(node, anonName());
+        name = nodeName.get(node);
+      }
+    }
+    if (!netNums.has(name)) {
+      netNums.set(name, netNames.length);
+      netNames.push(name);
+    }
+    return netNums.get(name);
+  }
+  for (const part of parts) for (const pad of part.pads) pad.netNum = resolve(pad.net);
+
+  // The file.
+  const q = str => '"' + String(str).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  const f = v => String(Math.round(v * 1000) / 1000);
+  const xy = (x, y, rot) => '(at ' + f(x) + ' ' + f(y) + (rot ? ' ' + rot : '') + ')';
+  const font = (size, thick, left) =>
+      '(effects (font (size ' + f(size) + ' ' + f(size) + ') (thickness ' + f(thick) +
+      '))' + (left ? ' (justify left)' : '') + ')';
+  let stamp = 0x5F000000;
+  const ts = () => (stamp++).toString(16).toUpperCase();
+  const out = [];
+  out.push('(kicad_pcb (version 20171130) (host pcbnew 5.1.12)', '',
+           '  (general', '    (thickness 1.6)',
+           '    (drawings ' + (edges.length + silk.length + texts.length) + ')',
+           '    (tracks 0)', '    (zones 0)',
+           '    (modules ' + parts.length + ')',
+           '    (nets ' + netNames.length + ')', '  )', '',
+           '  (page A4)', '  (layers');
+  const layers = ['0 F.Cu signal', '31 B.Cu signal', '32 B.Adhes user',
+                  '33 F.Adhes user', '34 B.Paste user', '35 F.Paste user',
+                  '36 B.SilkS user', '37 F.SilkS user', '38 B.Mask user',
+                  '39 F.Mask user', '40 Dwgs.User user', '41 Cmts.User user',
+                  '42 Eco1.User user', '43 Eco2.User user', '44 Edge.Cuts user',
+                  '45 Margin user', '46 B.CrtYd user', '47 F.CrtYd user',
+                  '48 B.Fab user', '49 F.Fab user'];
+  for (const l of layers) out.push('    (' + l + ')');
+  out.push('  )', '', '  (setup', '    (last_trace_width 0.25)',
+           '    (trace_clearance 0.2)', '    (zone_clearance 0.508)',
+           '    (zone_45_only no)', '    (trace_min 0.2)', '    (via_size 0.8)',
+           '    (via_drill 0.4)', '    (via_min_size 0.4)', '    (via_min_drill 0.3)',
+           '    (uvia_size 0.3)', '    (uvia_drill 0.1)', '    (uvias_allowed no)',
+           '    (uvia_min_size 0.2)', '    (uvia_min_drill 0.1)',
+           '    (edge_width 0.05)', '    (segment_width 0.2)',
+           '    (pcb_text_width 0.3)', '    (pcb_text_size 1.5 1.5)',
+           '    (mod_edge_width 0.12)', '    (mod_text_size 1 1)',
+           '    (mod_text_width 0.15)', '    (pad_size 1.524 1.524)',
+           '    (pad_drill 0.762)', '    (pad_to_mask_clearance 0.05)',
+           '    (aux_axis_origin 0 0)', '    (visible_elements FFFFFF7F)',
+           '    (pcbplotparams', '      (layerselection 0x010fc_ffffffff)',
+           '      (usegerberextensions false)', '      (usegerberattributes false)',
+           '      (usegerberadvancedattributes false)',
+           '      (creategerberjobfile false)', '      (excludeedgelayer true)',
+           '      (linewidth 0.100000)', '      (plotframeref false)',
+           '      (viasonmask false)', '      (mode 1)', '      (useauxorigin false)',
+           '      (hpglpennumber 1)', '      (hpglpenspeed 20)',
+           '      (hpglpendiameter 15.000000)', '      (psnegative false)',
+           '      (psa4output false)', '      (plotreference true)',
+           '      (plotvalue true)', '      (plotinvisibletext false)',
+           '      (padsonsilk false)', '      (subtractmaskfromsilk false)',
+           '      (outputformat 1)', '      (mirror false)', '      (drillshape 1)',
+           '      (scaleselection 1)', '      (outputdirectory ""))', '  )', '');
+  netNames.forEach((name, i) => out.push('  (net ' + i + ' ' + q(name) + ')'));
+  out.push('', '  (net_class Default "This is the default net class."',
+           '    (clearance 0.2)', '    (trace_width 0.25)', '    (via_dia 0.8)',
+           '    (via_drill 0.4)', '    (uvia_dia 0.3)', '    (uvia_drill 0.1)');
+  netNames.slice(1).forEach(name => out.push('    (add_net ' + q(name) + ')'));
+  out.push('  )', '');
+  for (const part of parts) {
+    out.push('  (module ' + q(part.fp) + ' (layer F.Cu) (tedit 0) (tstamp ' + ts() + ')',
+             '    ' + xy(part.x, part.y));
+    if (part.smd) out.push('    (attr smd)');
+    out.push('    (fp_text reference ' + q(part.ref) + ' ' + xy(...part.refAt) +
+             ' (layer F.SilkS)', '      ' + font(0.8, 0.12), '    )',
+             '    (fp_text value ' + q(part.value) + ' ' + xy(...part.valAt) +
+             ' (layer F.Fab)', '      ' + font(0.8, 0.12), '    )');
+    for (const [x1, y1, x2, y2] of part.lines) {
+      out.push('    (fp_line (start ' + f(x1) + ' ' + f(y1) + ') (end ' + f(x2) + ' ' +
+               f(y2) + ') (layer F.SilkS) (width 0.12))');
+    }
+    for (const [cx0, cy0, rad] of part.circles || []) {
+      out.push('    (fp_circle (center ' + f(cx0) + ' ' + f(cy0) + ') (end ' +
+               f(cx0 + rad) + ' ' + f(cy0) + ') (layer F.SilkS) (width 0.12))');
+    }
+    for (const pad of part.pads) {
+      const net = pad.netNum ? ' (net ' + pad.netNum + ' ' + q(netNames[pad.netNum]) + ')' : '';
+      const geo = xy(pad.x, pad.y) + ' (size ' + f(pad.w) + ' ' + f(pad.h) + ')';
+      if (pad.drill) {
+        out.push('    (pad ' + pad.num + ' thru_hole ' + (pad.shape || 'circle') + ' ' +
+                 geo + ' (drill ' + f(pad.drill) + ') (layers *.Cu *.Mask)' + net + ')');
+      } else {
+        out.push('    (pad ' + pad.num + ' smd rect ' + geo +
+                 ' (layers F.Cu F.Paste F.Mask)' + net + ')');
+      }
+    }
+    out.push('  )', '');
+  }
+  for (const [x1, y1, x2, y2] of edges) {
+    out.push('  (gr_line (start ' + f(x1) + ' ' + f(y1) + ') (end ' + f(x2) + ' ' +
+             f(y2) + ') (layer Edge.Cuts) (width 0.05))');
+  }
+  for (const [x1, y1, x2, y2] of silk) {
+    out.push('  (gr_line (start ' + f(x1) + ' ' + f(y1) + ') (end ' + f(x2) + ' ' +
+             f(y2) + ') (layer F.SilkS) (width 0.12))');
+  }
+  for (const t of texts) {
+    out.push('  (gr_text ' + q(t.text) + ' ' + xy(t.x, t.y, t.rot) + ' (layer F.SilkS)',
+             '    ' + font(t.size, t.size * 0.15, t.left), '  )');
+  }
+  out.push(')', '');
+
+  const bom = new Map();
+  for (const part of parts) {
+    const desc = part.value + ' (' + part.fp + ')';
+    bom.set(desc, (bom.get(desc) || 0) + 1);
+  }
+  const subCards = [...new Set(circuit.instances.map(inst => inst.card))].sort();
+  return {text: out.join('\n'),
+          name: state.current.replace(/[^A-Za-z0-9_-]+/g, '_') + '.kicad_pcb',
+          bom: [...bom], subCards};
+}
+
+// --- PCB dialog: the two options, a parts list preview, download.
+const pcbDialog = document.getElementById('pcbDialog');
+const pcbPkg = document.getElementById('pcbPkg');
+const pcbBom = document.getElementById('pcbBom');
+const pcbNote = document.getElementById('pcbNote');
+
+function pcbOptions() {
+  const sub = document.querySelector('input[name="pcbSub"]:checked');
+  return {inline: !sub || sub.value === 'inline', pkg: pcbPkg.value};
+}
+
+function refreshPcbDialog() {
+  let built;
+  try {
+    built = pcbBuild(pcbOptions());
+  } catch (err) {
+    pcbBom.textContent = 'Cannot build the board: ' + err.message;
+    return null;
+  }
+  pcbBom.textContent = 'Parts:';
+  const ul = document.createElement('ul');
+  for (const [desc, n] of built.bom) {
+    const li = document.createElement('li');
+    li.textContent = n + ' × ' + desc;
+    ul.appendChild(li);
+  }
+  pcbBom.appendChild(ul);
+  if (built.subCards.length) {
+    const div = document.createElement('div');
+    div.textContent = 'Boards to download separately and plug onto the sockets: ' +
+                      built.subCards.join(', ') + '.';
+    pcbBom.appendChild(div);
+  }
+  return built;
+}
+
+function openPcbDialog() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('fet-pcb') || '{}');
+    const radio = document.querySelector('input[name="pcbSub"][value="' +
+                                         (saved.inline === false ? 'header' : 'inline') + '"]');
+    if (radio) radio.checked = true;
+    if (saved.pkg in PCB_PKG) pcbPkg.value = saved.pkg;
+  } catch (err) { /* storage unavailable */ }
+  pcbNote.textContent = '';
+  refreshPcbDialog();
+  pcbDialog.showModal();
+}
+
+pcbDialog.addEventListener('change', () => { refreshPcbDialog(); });
+document.getElementById('pcbBtn').addEventListener('click', e => {
+  e.target.blur();
+  openPcbDialog();
+});
+document.getElementById('pcbDownloadBtn').addEventListener('click', () => {
+  const built = refreshPcbDialog();
+  if (!built) return;
+  try { localStorage.setItem('fet-pcb', JSON.stringify(pcbOptions())); }
+  catch (err) { /* storage unavailable */ }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([built.text], {type: 'application/octet-stream'}));
+  a.download = built.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  pcbNote.textContent = 'Saved ' + built.name + '.';
+});
+
+// ===== end PCB export =====
 
 // --- JSON dialog: export the whole state, all cards (auto-copied), or
 // paste and replace everything. Esc closes without changes.
@@ -1675,7 +2328,7 @@ const PAN_KEYS = {ArrowLeft: [-1, 0], ArrowRight: [1, 0],
                   ArrowUp: [0, -1], ArrowDown: [0, 1]};
 
 window.addEventListener('keydown', e => {
-  if (jsonDialog.open || nameDialog.open || cardDialog.open ||
+  if (jsonDialog.open || nameDialog.open || cardDialog.open || pcbDialog.open ||
       e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target;
   if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement ||
