@@ -42,19 +42,25 @@ pullup for the logic; in the physical sim its diode is exponential, so
 it passes about 2.7 mA into a low node and lets an undriven node under
 it float up to about 3.6 V.
 
-### PCB export
+### PCB and schematic export
 
-The **PCB…** button downloads the current card as a KiCad 5 board
-file (`.kicad_pcb`) — EasyEDA imports it with File › Import › KiCad,
-KiCad opens it directly. Every part is placed in a grid mirroring the
-card (empty rows and columns collapsed) with every net assigned, but
-nothing is routed: route or autoroute there, then order. Parts are
-2N7002 transistors in SOT-23, 10k chip resistors, a 1k from VDD plus
-a chip LED per LED pullup (0603 or 0805, selectable), and 6×6 mm tactile
-switches for buttons. The card's pins come out on a single-row
-2.54 mm header J1: GND, VDD, then the pins in their canonical order.
-Cards used inside the card are either inlined (their parts boxed and
-labelled on the silkscreen, their nets named `CARD1/NET`) or each
+The **PCB…** button downloads the current card for EasyEDA (File ›
+Open › KiCad) or KiCad, either as a board or as a schematic. The
+**PCB** is a KiCad 5 board file (`.kicad_pcb`): every part is placed
+in a grid mirroring the card (empty rows and columns collapsed) with
+every net assigned, but nothing is routed — route or autoroute there,
+then order. The **schematic** is a KiCad 5 schematic drawn square for
+square like the card, saved as two files, the sheet (`CARD.sch`) and
+its symbols (`CARD-cache.lib`); select both in EasyEDA's import
+dialog, then lay out the PCB from it as you like. Parts are 2N7002
+transistors in SOT-23, 10k chip resistors, a 1k from VDD plus a chip
+LED per LED pullup (0603 or 0805, selectable), and 6×6 mm tactile
+switches for buttons, with the same references, values and footprint
+names in both files. The card's pins come out on a single-row 2.54 mm
+header J1: GND, VDD, then the pins in their canonical order. Cards
+used inside the card are either inlined (on the board their parts
+boxed and labelled on the silkscreen, on the schematic drawn as their
+own block joined to the instance by `CARD1/PIN` labels) or each
 becomes a matching single-row socket — GND, VDD, that card's pins —
 that the card's own board plugs onto.
 

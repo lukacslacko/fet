@@ -16,7 +16,7 @@
   #jsonText { width: 480px; height: 320px; font-family: monospace; font-size: 12px; }
   #jsonRow, #cardRow { margin-top: 8px; display: flex; gap: 12px; align-items: center; }
   #jsonNote, #cardNote { color: #555; }
-  #pcbDialog { max-width: 540px; }
+  #pcbDialog { max-width: 560px; }
   .pcbOpt { margin-top: 10px; }
   .pcbOpt label { display: block; margin: 3px 0 0 14px; }
   #pcbBom { margin-top: 10px; color: #555; }
@@ -97,13 +97,17 @@
   </div>
 </dialog>
 <dialog id="pcbDialog">
-  <div><b>Download as a PCB</b> &mdash; a KiCad board file
-    (<code>.kicad_pcb</code>) that EasyEDA opens with File &rsaquo; Import
-    &rsaquo; KiCad, and KiCad opens directly. Every part is placed and
-    every net assigned, but nothing is routed: route it there (or run
-    the autorouter), then order. 2N7002 transistors, 10k pullups, a 1k
-    plus chip LED per LED pullup, 6&times;6&thinsp;mm tactile buttons; the
-    card's pins, after GND and VDD, on a single-row 2.54&thinsp;mm header.</div>
+  <div><b>Download for EasyEDA / KiCad.</b> The <b>PCB</b> is a KiCad
+    board file (<code>.kicad_pcb</code>): every part placed and every
+    net assigned, nothing routed &mdash; route it there (or run the
+    autorouter), then order. The <b>schematic</b> is a KiCad&nbsp;5
+    schematic drawn like this card, saved as two files, the sheet
+    (<code>.sch</code>) and its symbols (<code>-cache.lib</code>): select
+    both in EasyEDA's import dialog, then lay out the PCB from it as you
+    like. Both use 2N7002 transistors, 10k pullups, a 1k plus chip LED per
+    LED pullup, 6&times;6&thinsp;mm tactile buttons, and put the card's
+    pins, after GND and VDD, on a single-row 2.54&thinsp;mm header J1,
+    with matching references and footprint names.</div>
   <div class="pcbOpt">Cards used inside this one:
     <label><input type="radio" name="pcbSub" value="inline" checked>
       inline their circuits</label>
@@ -119,7 +123,8 @@
   </div>
   <div id="pcbBom"></div>
   <div id="pcbRow">
-    <button id="pcbDownloadBtn">Download</button>
+    <button id="pcbDownloadBtn">Download PCB</button>
+    <button id="schDownloadBtn">Download schematic</button>
     <span id="pcbNote"></span>
   </div>
 </dialog>
@@ -1378,6 +1383,19 @@ const PCB_PKG = {   // chip pads [mm]: pitch, and pad size along/across
 };
 const HDR_PITCH = 2.54;
 
+// Distinct pin names of a card in canonical order, each with the cell
+// key and the collectPins index of its first pin. The header and
+// socket pin order of both exports.
+function uniquePins(cardName) {
+  const out = [], seen = new Set();
+  collectPins(cardName).forEach((pin, i) => {
+    if (seen.has(pin.name)) return;
+    seen.add(pin.name);
+    out.push({name: pin.name, key: pin.r + ',' + pin.c, i});
+  });
+  return out;
+}
+
 // Builds the board: {text, name, bom, subCards} with the file text, a
 // file name, the parts list as [description, count] pairs and, in
 // socket mode, the cards to export separately.
@@ -1463,18 +1481,6 @@ function pcbBuild(opts) {
   const labelSpace = pins =>
       Math.max(...pins.map(p => textLen(p.name, 0.8))) + 2.2;
 
-  // Distinct pin names of a card in canonical order, each with the
-  // cell key and the collectPins index of its first pin.
-  function pinList(cardName) {
-    const out = [], seen = new Set();
-    collectPins(cardName).forEach((pin, i) => {
-      if (seen.has(pin.name)) return;
-      seen.add(pin.name);
-      out.push({name: pin.name, key: pin.r + ',' + pin.c, i});
-    });
-    return out;
-  }
-
   // Lays out one card as a table: every part-bearing cell is an item
   // at its (row, col) with a size; a column is as wide as its widest
   // item and a row as tall as its tallest, empty ones vanish. Returns
@@ -1538,7 +1544,7 @@ function pcbBuild(opts) {
             }};
           } else {
             const pins = [{name: 'GND', net: 'GND'}, {name: 'VDD', net: 'VDD'}];
-            for (const p of pinList(cell.card)) {
+            for (const p of uniquePins(cell.card)) {
               pins.push({name: p.name,
                          net: 'port:' + prefix + (r + 1) + ',' + (c + p.i) + ',s'});
             }
@@ -1593,7 +1599,7 @@ function pcbBuild(opts) {
   // labels, the parts grid below, the card name at the bottom.
   const top = layoutCard('', state.current, '', [state.current]);
   const hdrPins = [{name: 'GND', net: 'GND'}, {name: 'VDD', net: 'VDD'}];
-  for (const p of pinList(state.current)) {
+  for (const p of uniquePins(state.current)) {
     hdrPins.push({name: p.name, net: 'port:' + p.key + ',n'});
   }
   const M = 2.0;                              // board margin
@@ -1775,6 +1781,366 @@ function pcbBuild(opts) {
           bom: [...bom], subCards};
 }
 
+// ===== Schematic export =====
+// The current card as a KiCad 5 schematic (.sch) plus the symbol
+// library it references (-cache.lib), the pair EasyEDA imports with
+// File > Open > KiCad (select both files). Every square of the card
+// becomes a 600 mil square of the sheet: wires run between the
+// midpoints of the square edges exactly as in the editor, and the
+// parts get the same references, values and footprint names as the
+// PCB export, so the two describe one design. The card's pins are
+// global labels, also tied to a header symbol J1 above the circuit.
+// Cards used inside are either inlined - each drawn as its own block
+// below, its pins joined to the instance's box by global labels named
+// INSTANCE/PIN - or become a socket symbol filling the instance's box
+// (GND, VDD, that card's pins).
+
+const SCH = 600;   // mils per editor square
+
+// Symbol bodies in library units (mils, y up): graphics, then pins
+// as "X name number x y length direction ..." with the connection
+// point at (x, y) and the pin running `length` toward the body.
+const SCH_SYMBOLS = {
+  R: {ref: 'R', draw: [
+    'S -30 -50 30 50 0 1 10 N',
+    'X ~ 1 0 75 25 D 50 50 1 1 P',
+    'X ~ 2 0 -75 25 U 50 50 1 1 P']},
+  LED: {ref: 'D', draw: [
+    'P 4 0 1 10 -40 50 40 50 0 -10 -40 50 N',
+    'P 2 0 1 10 -40 -10 40 -10 N',
+    'P 2 0 1 10 0 -10 0 -50 N',
+    'P 2 0 1 6 30 10 60 40 N',
+    'P 3 0 1 6 45 40 60 40 60 25 N',
+    'P 2 0 1 6 45 -10 75 20 N',
+    'P 3 0 1 6 60 20 75 20 75 5 N',
+    'X A 2 0 75 25 D 50 50 1 1 P',
+    'X K 1 0 -75 25 U 50 50 1 1 P']},
+  NMOS_GL: {ref: 'Q', draw: [
+    'P 3 0 1 10 0 200 0 100 -100 100 N',
+    'P 3 0 1 10 0 -200 0 -100 -100 -100 N',
+    'P 2 0 1 20 -100 -140 -100 140 N',
+    'P 2 0 1 10 -200 0 -130 0 N',
+    'P 4 0 1 10 -130 -25 -100 0 -130 25 -130 -25 F',
+    'X G 1 -300 0 100 R 50 50 1 1 P',
+    'X S 2 0 -300 100 U 50 50 1 1 P',
+    'X D 3 0 300 100 D 50 50 1 1 P']},
+  NMOS_GR: {ref: 'Q', draw: [
+    'P 3 0 1 10 0 200 0 100 100 100 N',
+    'P 3 0 1 10 0 -200 0 -100 100 -100 N',
+    'P 2 0 1 20 100 -140 100 140 N',
+    'P 2 0 1 10 200 0 130 0 N',
+    'P 4 0 1 10 130 -25 100 0 130 25 130 -25 F',
+    'X G 1 300 0 100 L 50 50 1 1 P',
+    'X S 2 0 -300 100 U 50 50 1 1 P',
+    'X D 3 0 300 100 D 50 50 1 1 P']},
+  SW_PUSH: {ref: 'SW', draw: [
+    'C 0 150 10 0 1 8 N',
+    'C 0 -150 10 0 1 8 N',
+    'P 2 0 1 10 0 -150 70 130 N',
+    'X 1 1 0 300 150 D 50 50 1 1 P',
+    'X 2 2 0 -300 150 U 50 50 1 1 P']},
+  VDD: {ref: '#PWR', power: true, draw: [
+    'P 2 0 1 8 0 0 0 40 N',
+    'C 0 65 25 0 1 8 N',
+    'X VDD 1 0 0 0 U 50 50 1 1 W N']},
+  VDD_DN: {ref: '#PWR', power: true, draw: [    // the same, hanging down
+    'P 2 0 1 8 0 0 0 -40 N',
+    'C 0 -65 25 0 1 8 N',
+    'X VDD 1 0 0 0 D 50 50 1 1 W N']},
+  GND: {ref: '#PWR', power: true, draw: [
+    'P 2 0 1 8 0 0 0 -50 N',
+    'P 2 0 1 8 -50 -50 50 -50 N',
+    'P 2 0 1 8 -35 -70 35 -70 N',
+    'P 2 0 1 8 -20 -90 20 -90 N',
+    'X GND 1 0 0 0 D 50 50 1 1 W N']},
+};
+
+// Builds the schematic: {sch, lib, name, libName} with the two files'
+// text and names.
+function schBuild(opts) {
+  const inline = !!opts.inline;
+  const pkgName = opts.pkg in PCB_PKG ? opts.pkg : '0603';
+  persistCurrent();
+  const refCount = {};
+  const nextRef = prefix =>
+      prefix + (refCount[prefix] = (refCount[prefix] || 0) + 1);
+  const clean = str => str.replace(/[^A-Za-z0-9_\/.-]/g, '_');
+  const symName = str => str.replace(/[^A-Za-z0-9_]/g, '_');
+
+  // Symbols used, in order of first use; connectors are generated.
+  const symbols = new Map();
+  const useSymbol = name => {
+    if (!symbols.has(name)) symbols.set(name, SCH_SYMBOLS[name]);
+  };
+  // A connector: a box with pins along its bottom edge at the given
+  // x positions, their connection points at y = -depth.
+  function defConnector(name, pins, xs, depth, top, hw) {
+    if (symbols.has(name)) return;
+    const draw = ['S ' + (-hw) + ' ' + (100 - depth) + ' ' + hw + ' ' + top +
+                  ' 0 1 10 N'];
+    pins.forEach((p, i) => {
+      draw.push('X ' + symName(p.name) + ' ' + (i + 1) + ' ' + xs[i] + ' ' +
+                (-depth) + ' 100 U 50 50 1 1 P');
+    });
+    symbols.set(name, {ref: 'J', draw, pinNames: true});
+  }
+
+  const comps = [], wires = [], juncs = [], labels = [], notes = [], noteLines = [];
+  let stampN = 0;
+  const stamp = () => (0x5F100000 + stampN++).toString(16).toUpperCase();
+  let pwrN = 0;
+  // A placed symbol (never rotated); rp/vp are where the reference
+  // and value texts go on the sheet, [x, y, justify].
+  function comp(sym, ref, value, fp, x, y, rp, vp) {
+    useSymbol(sym);
+    comps.push({sym, ref, value, fp, x, y, rp, vp});
+  }
+  // Power flag with its pin at (x, y); a VDD one can hang downward.
+  function power(name, x, y, down) {
+    const ref = '#PWR' + (++pwrN);
+    const vp = name === 'GND' || down ? [x, y + 130, 'C'] : [x + 40, y - 65, 'L'];
+    comp(down ? name + '_DN' : name, ref, name, '', x, y, null, vp);
+  }
+  const wire = (x1, y1, x2, y2) => wires.push([x1, y1, x2, y2]);
+  const glabel = (text, x, y, orient) => labels.push({text, x, y, orient});
+  const noteRect = (x1, y1, x2, y2) =>
+      noteLines.push([x1, y1, x2, y1], [x2, y1, x2, y2], [x2, y2, x1, y2], [x1, y2, x1, y1]);
+
+  // Pass 1: the blocks (the card, then every inlined card, in the
+  // order the PCB export numbers parts) with their extents in squares.
+  const blocks = [];
+  function measure(prefix, card, path, stack) {
+    const b = {card, path, prefix, stack, rmin: Infinity, rmax: -Infinity,
+               cmin: Infinity, cmax: -Infinity, subs: new Map()};
+    blocks.push(b);
+    const instCount = {};
+    for (const [key, cell] of Object.entries(state.cards[card].cells)) {
+      const [r, c] = key.split(',').map(Number);
+      let rows = 1, cols = 1;
+      if (cell && cell.card) {
+        if (!state.cards[cell.card] || stack.includes(cell.card)) continue;
+        rows = 2;
+        cols = instWidth(cell.card);
+        const label = cell.card + (instCount[cell.card] = (instCount[cell.card] || 0) + 1);
+        if (inline) {
+          b.subs.set(key, measure(prefix + key + '#', cell.card,
+                                  path ? path + '/' + label : label,
+                                  [...stack, cell.card]));
+        }
+      }
+      b.rmin = Math.min(b.rmin, r);
+      b.rmax = Math.max(b.rmax, r + rows - 1);
+      b.cmin = Math.min(b.cmin, c);
+      b.cmax = Math.max(b.cmax, c + cols - 1);
+    }
+    if (b.rmin === Infinity) b.rmin = b.rmax = b.cmin = b.cmax = 0;
+    b.w = (b.cmax - b.cmin + 1) * SCH;
+    b.h = (b.rmax - b.rmin + 1) * SCH;
+    return b;
+  }
+  measure('', state.current, '', [state.current]);
+
+  // Pass 2: stack the blocks down the sheet under the header.
+  const X0 = 1000;
+  let yNext = 2600;
+  for (const b of blocks) {
+    b.x0 = X0;
+    b.y0 = yNext;
+    yNext += b.h + 1400;
+  }
+
+  // Pass 3: draw. Squares are 600 mil; a wire arm runs from the
+  // square's center to the midpoint of its edge, so arms of adjacent
+  // squares meet end to end, and part pins land on those midpoints.
+  function emit(b) {
+    const named = name => clean(b.path ? b.path + '/' + name : name);
+    const instCount = {};
+    for (const [key, cell] of Object.entries(state.cards[b.card].cells)) {
+      const [r, c] = key.split(',').map(Number);
+      const x = b.x0 + (c - b.cmin) * SCH, y = b.y0 + (r - b.rmin) * SCH;
+      const cx = x + SCH / 2, cy = y + SCH / 2;
+      if (cell === 'pullup') {
+        power('VDD', cx, y + 100);
+        wire(cx, y + 100, cx, y + 250);
+        comp('R', nextRef('R'), '10k', 'R_' + pkgName, cx, y + 325,
+             [cx + 50, y + 295, 'L'], [cx + 50, y + 355, 'L']);
+        wire(cx, y + 400, cx, y + 600);
+      } else if (cell === 'led') {
+        power('VDD', cx, y + 100);
+        wire(cx, y + 100, cx, y + 150);
+        comp('R', nextRef('R'), '1k', 'R_' + pkgName, cx, y + 225,
+             [cx + 50, y + 195, 'L'], [cx + 50, y + 255, 'L']);
+        wire(cx, y + 300, cx, y + 350);
+        comp('LED', nextRef('D'), 'LED', 'LED_' + pkgName, cx, y + 425,
+             [cx + 90, y + 425, 'L'], [cx + 90, y + 485, 'L']);
+        wire(cx, y + 500, cx, y + 600);
+      } else if (cell === 'left' || cell === 'right') {
+        // Reference and value on the side away from the gate.
+        const side = cell === 'left' ? 1 : -1;
+        comp(cell === 'left' ? 'NMOS_GL' : 'NMOS_GR', nextRef('Q'), '2N7002',
+             'SOT-23', cx, cy, [cx + side * 50, cy - 30, side > 0 ? 'L' : 'R'],
+             [cx + side * 50, cy + 30, side > 0 ? 'L' : 'R']);
+      } else if (cell === 'ground') {
+        wire(cx, y, cx, y + 200);
+        power('GND', cx, y + 200);
+      } else if (cell === 'btn-open' || cell === 'btn-closed') {
+        comp('SW_PUSH', nextRef('SW'), 'Tactile 6x6', 'SW_PUSH_6mm', cx, cy,
+             [cx + 100, cy - 30, 'L'], [cx + 100, cy + 30, 'L']);
+      } else if (cell === 'cross') {
+        wire(cx, y, cx, y + SCH);
+        wire(x, cy, x + SCH, cy);
+      } else if (cell && typeof cell === 'object') {
+        if (cell.pin !== undefined) {
+          wire(cx, y, cx, cy);
+          wire(cx, cy, cx, y + SCH);
+          glabel(named(cell.pin), cx, cy, 0);
+        } else if (cell.card) {
+          if (!state.cards[cell.card] || b.stack.includes(cell.card)) continue;
+          const label = cell.card + (instCount[cell.card] = (instCount[cell.card] || 0) + 1);
+          const n = instWidth(cell.card);
+          const pins = collectPins(cell.card);
+          const yb = y + 2 * SCH;    // the box's bottom edge
+          if (inline) {
+            // A labeled box; each column's port is a global label on a
+            // stub, which the inlined block's pin carries too.
+            noteRect(x + 20, y + 20, x + n * SCH - 20, yb - 20);
+            notes.push({text: label + ' = ' + cell.card, x: x + 60, y: y + 160});
+            const portPath = (b.path ? b.path + '/' : '') + label + '/';
+            pins.forEach((pin, i) => {
+              const xc = x + i * SCH + SCH / 2;
+              wire(xc, yb - 100, xc, yb);
+              glabel(clean(portPath + pin.name), xc, yb - 100, 1);
+            });
+            emit(b.subs.get(key));
+          } else {
+            // A socket symbol filling the box, its pins on the bottom
+            // edge: GND and VDD (flags below), then one per distinct
+            // pin name at that name's first column.
+            const socketPins = [{name: 'GND'}, {name: 'VDD'}];
+            for (const p of uniquePins(cell.card)) socketPins.push({name: p.name, col: p.i});
+            const hw = n * SCH / 2;
+            const sym = 'SOCKET_' + symName(cell.card);
+            defConnector(sym, socketPins, socketPins.map((p, i) =>
+                i === 0 ? 100 - hw : i === 1 ? 200 - hw : SCH / 2 + p.col * SCH - hw),
+                SCH, SCH - 10, hw - 10);
+            comp(sym, nextRef('J'), cell.card + ' socket',
+                 'PinSocket_1x' + socketPins.length + '_P2.54mm', x + hw, y + SCH,
+                 [x + 60, y + 100, 'L'], [x + hw, y + 250, 'C']);
+            wire(x + 100, yb, x + 100, yb + 100);
+            power('GND', x + 100, yb + 100);
+            wire(x + 200, yb, x + 200, yb + 100);
+            power('VDD', x + 200, yb + 100, true);
+            // Columns repeating a pin name join that name's pin inside
+            // the box, each name on its own level.
+            const first = new Map();
+            pins.forEach((pin, i) => {
+              if (!first.has(pin.name)) { first.set(pin.name, i); return; }
+              const level = yb - 150 - 50 * [...first.keys()].indexOf(pin.name);
+              const xa = x + first.get(pin.name) * SCH + SCH / 2;
+              const xb = x + i * SCH + SCH / 2;
+              wire(xa, yb, xa, level);
+              wire(xa, level, xb, level);
+              wire(xb, level, xb, yb);
+            });
+          }
+        } else {
+          const arms = 'nwes'.split('').filter(d => cell[d]);
+          const ends = {n: [cx, y], s: [cx, y + SCH], w: [x, cy], e: [x + SCH, cy]};
+          for (const d of arms) wire(cx, cy, ends[d][0], ends[d][1]);
+          if (arms.length >= 3) juncs.push([cx, cy]);
+          if (cell.name) {
+            // The label goes to a side with no arm where it can
+            // (0 puts the text left of its point, 2 right, 1 up, 3 down).
+            const orient = !cell.w ? 0 : !cell.e ? 2 : !cell.n ? 1 : 3;
+            glabel(named(cell.name), cx, cy, orient);
+          }
+        }
+      }
+    }
+    if (b !== blocks[0]) {
+      noteRect(b.x0 - 200, b.y0 - 500, b.x0 + b.w + 200, b.y0 + b.h + 200);
+      notes.push({text: b.path + ' = ' + b.card, x: b.x0, y: b.y0 - 250});
+    }
+  }
+
+  // The header J1 above the circuit: GND and VDD flags, then a global
+  // label per pin, matching the PCB's header.
+  const hdrPins = [{name: 'GND'}, {name: 'VDD'}];
+  for (const p of uniquePins(state.current)) hdrPins.push({name: p.name});
+  const nH = hdrPins.length;
+  const xs = hdrPins.map((p, i) => i * 200 - (nH - 1) * 100);
+  const hdrSym = 'CONN_' + symName(state.current);
+  defConnector(hdrSym, hdrPins, xs, 300, 200, (nH - 1) * 100 + 150);
+  const jx = X0 + (nH - 1) * 100 + 150, jy = 1200;
+  comp(hdrSym, nextRef('J'), state.current + ' pins', 'PinHeader_1x' + nH + '_P2.54mm',
+       jx, jy, [jx - (nH - 1) * 100 - 200, jy, 'R'], [jx, jy - 100, 'C']);
+  hdrPins.forEach((p, i) => {
+    const px = jx + xs[i], py = jy + 300;
+    wire(px, py, px, py + 100);
+    if (i === 0) power('GND', px, py + 100);
+    else if (i === 1) power('VDD', px, py + 100, true);
+    else glabel(clean(p.name), px, py + 100, 3);
+  });
+  emit(blocks[0]);
+
+  // The files.
+  const q = str => '"' + String(str).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  const sheetW = Math.max(...blocks.map(b => b.x0 + b.w), jx + (nH - 1) * 100 + 300) + 1500;
+  const sheetH = yNext + 600;
+  const sch = ['EESchema Schematic File Version 4', 'EELAYER 30 0', 'EELAYER END',
+               '$Descr User ' + sheetW + ' ' + sheetH, 'encoding utf-8', 'Sheet 1 1',
+               'Title ' + q(state.current), 'Date ""', 'Rev ""', 'Comp ""',
+               'Comment1 ""', 'Comment2 ""', 'Comment3 ""', 'Comment4 ""', '$EndDescr'];
+  const field = (n, text, x, y, just, hidden) =>
+      'F ' + n + ' ' + q(text) + ' H ' + x + ' ' + y + ' 50  ' + (hidden ? '0001' : '0000') +
+      ' ' + just + ' CNN';
+  for (const c of comps) {
+    // Field positions are stored in the symbol's own frame, whose y
+    // axis points up: a text meant to sit below the symbol is written
+    // above it.
+    const power = c.ref[0] === '#';
+    const rp = c.rp || [c.x, c.y, 'C'];
+    sch.push('$Comp', 'L fet:' + c.sym + ' ' + c.ref, 'U 1 1 ' + stamp(),
+             'P ' + c.x + ' ' + c.y,
+             field(0, c.ref, rp[0], 2 * c.y - rp[1], rp[2], power),
+             field(1, c.value, c.vp[0], 2 * c.y - c.vp[1], c.vp[2], false),
+             field(2, c.fp, c.x, c.y, 'C', true),
+             field(3, '', c.x, c.y, 'C', true),
+             '\t1    ' + c.x + ' ' + c.y,
+             '\t1    0    0    -1  ',
+             '$EndComp');
+  }
+  for (const [x1, y1, x2, y2] of wires) {
+    sch.push('Wire Wire Line', '\t' + x1 + ' ' + y1 + ' ' + x2 + ' ' + y2);
+  }
+  for (const [x, y] of juncs) sch.push('Connection ~ ' + x + ' ' + y);
+  for (const l of labels) {
+    sch.push('Text GLabel ' + l.x + ' ' + l.y + ' ' + l.orient + '    50   Input ~ 0', l.text);
+  }
+  for (const [x1, y1, x2, y2] of noteLines) {
+    sch.push('Wire Notes Line', '\t' + x1 + ' ' + y1 + ' ' + x2 + ' ' + y2);
+  }
+  for (const t of notes) sch.push('Text Notes ' + t.x + ' ' + t.y + ' 0    60   ~ 0', t.text);
+  sch.push('$EndSCHEMATC', '');
+
+  const lib = ['EESchema-LIBRARY Version 2.4', '#encoding utf-8'];
+  for (const [name, sym] of symbols) {
+    lib.push('#', '# fet_' + name, '#',
+             'DEF fet_' + name + ' ' + sym.ref + ' 0 ' + (sym.pinNames ? '30 N Y' : '0 N N') +
+             ' 1 F ' + (sym.power ? 'P' : 'N'),
+             'F0 ' + q(sym.ref) + ' 0 100 50 H ' + (sym.power ? 'I' : 'V') + ' C CNN',
+             'F1 ' + q('fet_' + name) + ' 0 -100 50 H V C CNN',
+             'F2 "" 0 0 50 H I C CNN', 'F3 "" 0 0 50 H I C CNN',
+             'DRAW', ...sym.draw, 'ENDDRAW', 'ENDDEF');
+  }
+  lib.push('#', '#End Library', '');
+  const base = state.current.replace(/[^A-Za-z0-9_-]+/g, '_');
+  return {sch: sch.join('\n'), lib: lib.join('\n'),
+          name: base + '.sch', libName: base + '-cache.lib'};
+}
+
+// ===== end schematic export =====
+
 // --- PCB dialog: the two options, a parts list preview, download.
 const pcbDialog = document.getElementById('pcbDialog');
 const pcbPkg = document.getElementById('pcbPkg');
@@ -1829,19 +2195,43 @@ document.getElementById('pcbBtn').addEventListener('click', e => {
   e.target.blur();
   openPcbDialog();
 });
-document.getElementById('pcbDownloadBtn').addEventListener('click', () => {
-  const built = refreshPcbDialog();
-  if (!built) return;
-  try { localStorage.setItem('fet-pcb', JSON.stringify(pcbOptions())); }
-  catch (err) { /* storage unavailable */ }
+function saveFile(name, text) {
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([built.text], {type: 'application/octet-stream'}));
-  a.download = built.name;
+  a.href = URL.createObjectURL(new Blob([text], {type: 'application/octet-stream'}));
+  a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function rememberPcbOptions() {
+  try { localStorage.setItem('fet-pcb', JSON.stringify(pcbOptions())); }
+  catch (err) { /* storage unavailable */ }
+}
+
+document.getElementById('pcbDownloadBtn').addEventListener('click', () => {
+  const built = refreshPcbDialog();
+  if (!built) return;
+  rememberPcbOptions();
+  saveFile(built.name, built.text);
   pcbNote.textContent = 'Saved ' + built.name + '.';
+});
+document.getElementById('schDownloadBtn').addEventListener('click', () => {
+  if (!refreshPcbDialog()) return;
+  rememberPcbOptions();
+  let built;
+  try {
+    built = schBuild(pcbOptions());
+  } catch (err) {
+    pcbNote.textContent = 'Cannot build the schematic: ' + err.message;
+    return;
+  }
+  saveFile(built.name, built.sch);
+  // The browser may ask to allow the second download.
+  setTimeout(() => saveFile(built.libName, built.lib), 300);
+  pcbNote.textContent = 'Saved ' + built.name + ' and ' + built.libName +
+                        ' (allow both downloads); import them together.';
 });
 
 // ===== end PCB export =====
